@@ -14,6 +14,7 @@ import (
 	"gioui.org/f32"
 	"gioui.org/font"
 	"gioui.org/font/gofont"
+	"gioui.org/gesture"
 	"gioui.org/io/clipboard"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -127,6 +128,8 @@ type ui struct {
 	showLog                    bool
 	backdrop                   paint.ImageOp
 	an                         animator
+	sliderHover                map[*widget.Float]*gesture.Hover
+	wasDragging                bool
 	micSel, spkSel             widget.Clickable
 	micOpen, spkOpen           bool
 	micList, spkList           []AudioDevice
@@ -333,6 +336,15 @@ func (u *ui) update(gtx layout.Context) {
 	if save {
 		a.Save()
 	}
+	// save once a drag on any slider ends
+	dragging := false
+	for _, f := range []*widget.Float{&u.sens, &u.vol, &u.rng, &u.muff, &u.opacityF, &u.panelF} {
+		dragging = dragging || f.Dragging()
+	}
+	if u.wasDragging && !dragging {
+		a.Save()
+	}
+	u.wasDragging = dragging
 }
 
 // ---------- building blocks ----------
@@ -504,10 +516,12 @@ func (u *ui) button(c *widget.Clickable, ic *widget.Icon, label string, kind btn
 		case btnDanger:
 			bg = lerpC(bg, withAlpha(colBad, 0x38), h)
 		}
-		return c.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		// The clickable clips to its own size, so record it and draw the
+		// (bouncing, possibly larger) button outside that clip.
+		macro := op.Record(gtx.Ops)
+		dims := c.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			pointer.CursorPointer.Add(gtx.Ops)
-			macro := op.Record(gtx.Ops)
-			dims := layout.Inset{Top: 10, Bottom: 10, Left: 18, Right: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: 10, Bottom: 10, Left: 18, Right: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				if full {
 					gtx.Constraints.Min.X = gtx.Constraints.Max.X
 				}
@@ -537,15 +551,17 @@ func (u *ui) button(c *widget.Clickable, ic *widget.Icon, label string, kind btn
 					}),
 				)
 			})
-			call := macro.Stop()
-			if kind != btnGhost {
-				lift := 3 + int(2*h+0.5) // hover lifts the button a little
-				shadow(gtx, dims.Size, dims.Size.Y/2, lift, 0x30)
-			}
-			rrect(gtx, dims.Size, dims.Size.Y/2, bg)
-			call.Add(gtx.Ops)
-			return dims
 		})
+		call := macro.Stop()
+		sc := u.an.bounce(gtx, c, popTarget(dims.Size, c.Hovered(), c.Pressed()))
+		defer op.Affine(scaleAbout(dims.Size, sc)).Push(gtx.Ops).Pop()
+		if kind != btnGhost {
+			lift := 3 + int(2*h+0.5) // hover lifts the button a little
+			shadow(gtx, dims.Size, dims.Size.Y/2, lift, 0x30)
+		}
+		rrect(gtx, dims.Size, dims.Size.Y/2, bg)
+		call.Add(gtx.Ops)
+		return dims
 	}
 }
 
@@ -790,11 +806,7 @@ func (u *ui) sliderRow(name, value string, f *widget.Float) layout.Widget {
 					layout.Rigid(u.label(13, value, colAccent)),
 				)
 			},
-			func(gtx layout.Context) layout.Dimensions {
-				s := material.Slider(u.th, f)
-				s.Color = colAccent
-				return s.Layout(gtx)
-			},
+			func(gtx layout.Context) layout.Dimensions { return u.slider(gtx, f) },
 		)
 	}
 }
@@ -1284,10 +1296,10 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 			}
 		}
 		field := func(gtx layout.Context) layout.Dimensions {
-			return sel.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			macro := op.Record(gtx.Ops)
+			d := sel.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				pointer.CursorPointer.Add(gtx.Ops)
-				macro := op.Record(gtx.Ops)
-				d := layout.Inset{Top: 10, Bottom: 10, Left: 14, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Top: 10, Bottom: 10, Left: 14, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					gtx.Constraints.Min.X = gtx.Constraints.Max.X
 					return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -1316,15 +1328,17 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 						}),
 					)
 				})
-				call := macro.Stop()
-				bg := colField
-				if sel.Hovered() {
-					bg = colHover
-				}
-				glass(gtx, d.Size, gtx.Dp(12), bg, color.NRGBA{255, 255, 255, 0x1c})
-				call.Add(gtx.Ops)
-				return d
 			})
+			call := macro.Stop()
+			bg := colField
+			if sel.Hovered() {
+				bg = colHover
+			}
+			sc := u.an.bounce(gtx, sel, popTarget(d.Size, sel.Hovered(), sel.Pressed()))
+			defer op.Affine(scaleAbout(d.Size, sc)).Push(gtx.Ops).Pop()
+			glass(gtx, d.Size, gtx.Dp(12), bg, color.NRGBA{255, 255, 255, 0x1c})
+			call.Add(gtx.Ops)
+			return d
 		}
 		if !open {
 			return field(gtx)
@@ -1383,4 +1397,101 @@ func shortDevice(id string) string {
 		id = id[:40] + "…"
 	}
 	return id
+}
+
+// popTarget: how big a control grows on hover. About 6 px for wide controls,
+// up to 6% for small ones; pressing squishes it a little.
+func popTarget(size image.Point, hovered, pressed bool) float32 {
+	if pressed {
+		return 0.97
+	}
+	if !hovered || size.X <= 0 {
+		return 1
+	}
+	g := float32(12) / float32(size.X)
+	if g > 0.06 {
+		g = 0.06
+	}
+	return 1 + g
+}
+
+// slider: rounded track, glowing fill and a knob that bounces bigger on hover
+// and when grabbed. Clicking somewhere glides the knob there.
+func (u *ui) slider(gtx layout.Context, f *widget.Float) layout.Dimensions {
+	if u.sliderHover == nil {
+		u.sliderHover = map[*widget.Float]*gesture.Hover{}
+	}
+	hv := u.sliderHover[f]
+	if hv == nil {
+		hv = new(gesture.Hover)
+		u.sliderHover[f] = hv
+	}
+	r := gtx.Dp(8) // knob radius
+	h := gtx.Dp(30)
+	w := gtx.Constraints.Max.X
+	// input (the Float handles clicks and drags)
+	in := gtx
+	in.Constraints = layout.Exact(image.Pt(w-2*r, h))
+	off := op.Offset(image.Pt(r, 0)).Push(gtx.Ops)
+	f.Layout(in, layout.Horizontal, 8)
+	off.Pop()
+	// hover detection on top, letting clicks pass through to the slider
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	area := clip.Rect{Max: image.Pt(w, h)}.Push(gtx.Ops)
+	hv.Add(gtx.Ops)
+	pointer.CursorPointer.Add(gtx.Ops)
+	area.Pop()
+	pass.Pop()
+	hovered := hv.Update(gtx.Source)
+
+	v := f.Value
+	if f.Dragging() {
+		u.an.set(f, v) // follow the finger exactly
+	} else {
+		v = u.an.to(gtx, f, v, 16) // glide after a click
+	}
+	x := r + int(v*float32(w-2*r))
+	cy := h / 2
+	th := gtx.Dp(5)
+	// track
+	tr := image.Rect(r, cy-th/2, w-r, cy+th/2)
+	st := clip.UniformRRect(tr, th/2).Push(gtx.Ops)
+	paint.Fill(gtx.Ops, color.NRGBA{255, 255, 255, 0x26})
+	st.Pop()
+	if x > r {
+		fl := image.Rect(r, cy-th/2, x, cy+th/2)
+		st := clip.UniformRRect(fl, th/2).Push(gtx.Ops)
+		paint.Fill(gtx.Ops, colAccent)
+		st.Pop()
+	}
+	// knob
+	target := float32(1)
+	switch {
+	case f.Dragging():
+		target = 1.45
+	case hovered:
+		target = 1.25
+	}
+	sc := u.an.bounce(gtx, hv, target)
+	kr := int(float32(r) * sc)
+	ko := op.Offset(image.Pt(x-kr, cy-kr)).Push(gtx.Ops)
+	ks := image.Pt(2*kr, 2*kr)
+	shadow(gtx, ks, kr, 3, 0x40)
+	if sc > 1.01 { // soft glow while active
+		gr := int(float32(kr) * 0.45 * (sc - 1) / 0.45)
+		g := op.Offset(image.Pt(-gr, -gr)).Push(gtx.Ops)
+		gs := clip.Ellipse(image.Rectangle{Max: ks.Add(image.Pt(2*gr, 2*gr))}).Push(gtx.Ops)
+		paint.Fill(gtx.Ops, withAlpha(colAccent, 0x30))
+		gs.Pop()
+		g.Pop()
+	}
+	kc := clip.Ellipse(image.Rectangle{Max: ks}).Push(gtx.Ops)
+	paint.Fill(gtx.Ops, rgb(0xffffff))
+	kc.Pop()
+	in2 := gtx.Dp(3)
+	ki := clip.Ellipse(image.Rectangle{Min: image.Pt(in2, in2), Max: ks.Sub(image.Pt(in2, in2))}).Push(gtx.Ops)
+	paint.Fill(gtx.Ops, colAccent)
+	ki.Pop()
+	ko.Pop()
+	return layout.Dimensions{Size: image.Pt(w, h)}
 }

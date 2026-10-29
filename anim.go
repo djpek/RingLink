@@ -4,10 +4,12 @@ package main
 // ask for another frame until they've settled.
 
 import (
+	"image"
 	"image/color"
 	"math"
 	"time"
 
+	"gioui.org/f32"
 	"gioui.org/layout"
 	"gioui.org/op"
 )
@@ -19,8 +21,9 @@ type tween struct {
 }
 
 type animator struct {
-	vals  map[any]*tween
-	start time.Time
+	vals    map[any]*tween
+	springs map[any]*spring
+	start   time.Time
 }
 
 // to moves the value for key toward target. rate is roughly "1/seconds";
@@ -89,4 +92,55 @@ func (a *animator) set(key any, v float32) {
 	} else {
 		a.vals[key] = &tween{v: v, last: time.Now(), init: true}
 	}
+}
+
+// ---------- springs (bouncy scale) ----------
+
+type spring struct {
+	x, v float32
+	last time.Time
+}
+
+// bounce moves a scale factor toward target on a spring. Growing is a little
+// under-damped, so it overshoots and settles (the "pop"); shrinking back is
+// critically damped, so it just eases down to normal size.
+func (a *animator) bounce(gtx layout.Context, key any, target float32) float32 {
+	if a.springs == nil {
+		a.springs = map[any]*spring{}
+	}
+	s := a.springs[key]
+	if s == nil {
+		s = &spring{x: target, last: gtx.Now}
+		a.springs[key] = s
+		return target
+	}
+	dt := float32(gtx.Now.Sub(s.last).Seconds())
+	s.last = gtx.Now
+	if dt > 0.05 {
+		dt = 1.0 / 60
+	}
+	const k = 520 // stiffness
+	zeta := float32(0.38)
+	if target < s.x {
+		zeta = 1
+	}
+	c := 2 * zeta * float32(math.Sqrt(k))
+	for steps := int(dt*480) + 1; steps > 0; steps-- {
+		h := dt / float32(int(dt*480)+1)
+		acc := -k*(s.x-target) - c*s.v
+		s.v += acc * h
+		s.x += s.v * h
+	}
+	if d := s.x - target; d < 0.0005 && d > -0.0005 && s.v < 0.002 && s.v > -0.002 {
+		s.x, s.v = target, 0
+	} else {
+		gtx.Execute(op.InvalidateCmd{})
+	}
+	return s.x
+}
+
+// scaleAbout returns a transform that scales by s around the centre of size.
+func scaleAbout(size image.Point, s float32) f32.Affine2D {
+	c := f32.Pt(float32(size.X)/2, float32(size.Y)/2)
+	return f32.Affine2D{}.Scale(c, f32.Pt(s, s))
 }
