@@ -30,10 +30,10 @@ import (
 
 var (
 	colBg      = rgb(0x1c2026)
-	colCard    = color.NRGBA{255, 255, 255, 0x17} // frosted panel
+	colCard    = glassCard // frosted panel (see setPalette)
 	colBorder  = color.NRGBA{255, 255, 255, 0x2e}
-	colField   = color.NRGBA{255, 255, 255, 0x14}
-	colHover   = color.NRGBA{255, 255, 255, 0x26}
+	colField   = glassField
+	colHover   = glassHover
 	colSelect  = color.NRGBA{255, 255, 255, 0xe6} // selected segment
 	colText    = rgb(0xf4f6f9)
 	colMuted   = color.NRGBA{235, 240, 246, 0xb0}
@@ -44,6 +44,27 @@ var (
 	colWarn    = rgb(0xf5c451)
 	colBad     = rgb(0xff7b7b)
 )
+
+var (
+	glassCard  = color.NRGBA{255, 255, 255, 0x17}
+	glassField = color.NRGBA{255, 255, 255, 0x14}
+	glassHover = color.NRGBA{255, 255, 255, 0x26}
+	segTrack   = color.NRGBA{0, 0, 0, 0x26}
+)
+
+// setPalette: over the real desktop, panels and buttons are dark tints whose
+// opacity the user picks; otherwise they're frosted white over the backdrop.
+func setPalette(seeThrough bool, panelPct int) {
+	if !seeThrough {
+		colCard, colField, colHover, segTrack = glassCard, glassField, glassHover, color.NRGBA{0, 0, 0, 0x26}
+		return
+	}
+	a := func(f float64) uint8 { return uint8(float64(panelPct) * 2.55 * f) }
+	colCard = color.NRGBA{22, 26, 33, a(0.7)}
+	colField = color.NRGBA{44, 50, 60, a(1)}
+	colHover = color.NRGBA{62, 70, 82, a(1)}
+	segTrack = color.NRGBA{30, 35, 43, a(1)}
+}
 
 func rgb(c uint32) color.NRGBA {
 	return color.NRGBA{R: uint8(c >> 16), G: uint8(c >> 8), B: uint8(c), A: 0xff}
@@ -103,7 +124,7 @@ type ui struct {
 	showLog                    bool
 	backdrop                   paint.ImageOp
 	view                       app.ViewEvent
-	opacityF                   widget.Float
+	opacityF, panelF           widget.Float
 	appliedOpacity             int
 	opacityOK                  bool
 }
@@ -123,7 +144,8 @@ func runUI() {
 	u.codeEd.SingleLine = true
 	u.nameEd.SetText(u.app.S.DisplayName)
 	u.sens.Value = float32(u.app.Voice.Sens.Load()) / 100
-	u.opacityF.Value = float32(u.opacity()-50) / 50
+	u.opacityF.Value = float32(u.opacity()) / 100
+	u.panelF.Value = float32(u.panelOpacity()) / 100
 	u.syncFX()
 	go func() {
 		for range time.Tick(250 * time.Millisecond) {
@@ -142,8 +164,8 @@ func runUI() {
 			u.appliedOpacity = -1
 		case app.FrameEvent:
 			u.applyOpacity()
+			setPalette(u.seeThrough(), u.panelOpacity())
 			gtx := app.NewContext(&ops, e)
-			paint.Fill(gtx.Ops, colBg)
 			u.drawBackdrop(gtx)
 			u.update(gtx)
 			u.layout(gtx)
@@ -210,8 +232,20 @@ func (u *ui) update(gtx layout.Context) {
 		a.Voice.Muted.Store(!a.Voice.Muted.Load())
 	}
 	if u.opacityF.Update(gtx) {
-		a.S.Opacity = 50 + int(u.opacityF.Value*50+0.5)
+		a.S.Opacity = int(u.opacityF.Value*100 + 0.5)
+		if a.S.Opacity < 1 {
+			a.S.Opacity = 1 // 0 means "unset" in the settings file
+		}
 		if !u.opacityF.Dragging() {
+			a.Save()
+		}
+	}
+	if u.panelF.Update(gtx) {
+		a.S.PanelAlpha = int(u.panelF.Value*100 + 0.5)
+		if a.S.PanelAlpha < 10 {
+			a.S.PanelAlpha = 10
+		}
+		if !u.panelF.Dragging() {
 			a.Save()
 		}
 	}
@@ -299,25 +333,53 @@ func (u *ui) opacity() int {
 	if o <= 0 || o > 100 {
 		return 100
 	}
-	if o < 50 {
-		return 50
+	if !perPixel() && o < 40 {
+		return 40 // fading the whole window further makes it unreadable
 	}
 	return o
 }
 
+func (u *ui) panelOpacity() int {
+	p := u.app.S.PanelAlpha
+	if p <= 0 || p > 100 {
+		return 90
+	}
+	return p
+}
+
+func (u *ui) seeThrough() bool { return perPixel() && u.opacity() < 100 }
+
+var blurHinted bool
+
+// perPixel: only the background is see-through (Linux/X11 with the patched Gio).
+func perPixel() bool { return app.TransparentActive }
+
 func (u *ui) applyOpacity() {
 	o := u.opacity()
-	if u.view == nil || o == u.appliedOpacity {
+	key := o
+	if perPixel() {
+		key += 1000
+	}
+	if u.view == nil || key == u.appliedOpacity {
 		return
 	}
-	u.appliedOpacity = o
+	u.appliedOpacity = key
+	if perPixel() {
+		u.opacityOK = true // handled when painting the background
+		blurHinted = setBlurBehind(u.view, o < 100)
+		return
+	}
 	u.opacityOK = setWindowOpacity(u.view, float64(o)/100)
 }
 
 func (u *ui) drawBackdrop(gtx layout.Context) {
-	if u.opacity() < 100 && u.opacityOK {
-		// see-through window: a plain dark tint reads best over the desktop
-		paint.Fill(gtx.Ops, rgb(0x12161c))
+	if o := u.opacity(); o < 100 && u.opacityOK {
+		// see-through: a plain dark tint reads best over the desktop
+		c := rgb(0x12161c)
+		if perPixel() {
+			c.A = uint8(o * 255 / 100) // only the background fades
+		}
+		paint.Fill(gtx.Ops, c)
 		return
 	}
 	sz := u.backdrop.Size()
@@ -581,7 +643,7 @@ func (u *ui) segmented(gtx layout.Context, sel int) layout.Dimensions {
 		return layout.Flex{}.Layout(gtx, ch...)
 	})
 	call := macro.Stop()
-	glass(gtx, dims.Size, dims.Size.Y/2, color.NRGBA{0, 0, 0, 0x26}, color.NRGBA{255, 255, 255, 0x1c})
+	glass(gtx, dims.Size, dims.Size.Y/2, segTrack, color.NRGBA{255, 255, 255, 0x1c})
 	call.Add(gtx.Ops)
 	return dims
 }
@@ -1100,7 +1162,19 @@ func f32Scale(s float32) f32.Affine2D { return f32.Affine2D{}.Scale(f32.Point{},
 
 func (u *ui) lookCard(gtx layout.Context) layout.Dimensions {
 	return u.card(gtx, icTune, "Appearance", nil, func(gtx layout.Context) layout.Dimensions {
-		note := "Lower it to see your desktop through the window."
+		if perPixel() {
+			note := "Lower the background to see your desktop behind RingLink. Needs a compositing desktop (Linux Mint has one). Your desktop can't blur what's behind, so it shows through sharp."
+			if blurHinted {
+				note = "Lower the background to see your desktop behind RingLink. Blur works on desktops that support it (like KDE Plasma); Linux Mint's Cinnamon shows it sharp."
+			}
+			return col(gtx,
+				u.sliderRow("Background", fmt.Sprintf("%d%%", u.opacity()), &u.opacityF),
+				vgap(4),
+				u.sliderRow("Panels & buttons", fmt.Sprintf("%d%%", u.panelOpacity()), &u.panelF),
+				u.caption(note),
+			)
+		}
+		note := "Lower it to see your desktop through the whole window."
 		if u.view != nil && !u.opacityOK {
 			note = "Your desktop doesn't support see-through windows (e.g. Wayland), so this has no effect."
 		}

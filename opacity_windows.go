@@ -40,3 +40,5 @@ func setWindowOpacity(v app.ViewEvent, frac float64) bool {
 	r, _, _ := pSetLayeredWindowAttributes.Call(w.HWND, 0, a, lwaAlpha)
 	return r != 0
 }
+
+func setBlurBehind(v app.ViewEvent, on bool) bool { return false }

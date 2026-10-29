@@ -17,7 +17,7 @@ Proximity voice chat for **Le Mans Ultimate** and **BeamNG.drive**: the closer s
 
 Voice starts automatically once you're in a room. When you're on the same LMU server or BeamMP map, each person's volume follows the distance between your cars. Anywhere else (menus, garage, different servers) it's normal voice chat.
 
-Under **Appearance** you can lower the window opacity to see your desktop through RingLink (Linux on X11, e.g. Linux Mint, and Windows).
+Under **Appearance** you can make RingLink see-through. On Linux (X11, e.g. Linux Mint) only the background goes see-through, with separate sliders for the background and for panels & buttons; desktops that support it (KDE Plasma) also blur what's behind. On Windows the whole window fades.
 
 You can set how loud everyone is, how far voices carry, how muffled they get with distance, and your mic sensitivity.
 
@@ -52,7 +52,7 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui" -o RingLink.exe .  #
 
 For screenshots or testing without a microphone, build with `-tags fakeaudio`: the mic "talks" every few seconds and sound output is discarded.
 
-UI built with [Gio](https://gioui.org), using the [SN Pro](https://github.com/supernotes/sn-pro) font (SIL Open Font License 1.1, see `fonts/OFL.txt`).
+UI built with [Gio](https://gioui.org) (a lightly patched copy is in `third_party/gioui` to support see-through backgrounds on X11; Gio is dual Unlicense/MIT licensed), using the [SN Pro](https://github.com/supernotes/sn-pro) font (SIL Open Font License 1.1, see `fonts/OFL.txt`).
 
 <p align="center"><img src="docs/three-people.png" alt="Three people in one room"></p>
 
