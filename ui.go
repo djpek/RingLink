@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -125,6 +126,7 @@ type ui struct {
 	copiedAt                   time.Time
 	showLog                    bool
 	backdrop                   paint.ImageOp
+	an                         animator
 	micSel, spkSel             widget.Clickable
 	micOpen, spkOpen           bool
 	micList, spkList           []AudioDevice
@@ -262,6 +264,7 @@ func (u *ui) update(gtx layout.Context) {
 	if u.micSel.Clicked(gtx) {
 		u.micOpen, u.spkOpen = !u.micOpen, false
 		if u.micOpen {
+			u.an.set("open:Microphone", 0)
 			u.micList = append([]AudioDevice{{"", "System default"}}, listMics()...)
 			u.micOpts = make([]widget.Clickable, len(u.micList))
 		}
@@ -269,6 +272,7 @@ func (u *ui) update(gtx layout.Context) {
 	if u.spkSel.Clicked(gtx) {
 		u.spkOpen, u.micOpen = !u.spkOpen, false
 		if u.spkOpen {
+			u.an.set("open:Output", 0)
 			u.spkList = append([]AudioDevice{{"", "System default"}}, listSpeakers()...)
 			u.spkOpts = make([]widget.Clickable, len(u.spkList))
 		}
@@ -490,15 +494,15 @@ func (u *ui) button(c *widget.Clickable, ic *widget.Icon, label string, kind btn
 		case btnDanger:
 			bg, fg = withAlpha(colBad, 0x22), colBad
 		}
-		if c.Hovered() {
-			switch kind {
-			case btnPrimary:
-				bg = rgb(0x8fd3fa)
-			case btnSecondary, btnGhost:
-				bg = colHover
-			case btnDanger:
-				bg = withAlpha(colBad, 0x38)
-			}
+		hv := map[bool]float32{false: 0, true: 1}[c.Hovered()]
+		h := u.an.to(gtx, c, hv, 16)
+		switch kind {
+		case btnPrimary:
+			bg = lerpC(bg, rgb(0x8fd3fa), h)
+		case btnSecondary, btnGhost:
+			bg = lerpC(bg, colHover, h)
+		case btnDanger:
+			bg = lerpC(bg, withAlpha(colBad, 0x38), h)
 		}
 		return c.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			pointer.CursorPointer.Add(gtx.Ops)
@@ -535,10 +539,7 @@ func (u *ui) button(c *widget.Clickable, ic *widget.Icon, label string, kind btn
 			})
 			call := macro.Stop()
 			if kind != btnGhost {
-				lift := 3
-				if c.Hovered() {
-					lift = 5 // hover lifts the button a little
-				}
+				lift := 3 + int(2*h+0.5) // hover lifts the button a little
 				shadow(gtx, dims.Size, dims.Size.Y/2, lift, 0x30)
 			}
 			rrect(gtx, dims.Size, dims.Size.Y/2, bg)
@@ -619,7 +620,11 @@ func (u *ui) pill(s string, c color.NRGBA) layout.Widget {
 	return func(gtx layout.Context) layout.Dimensions {
 		macro := op.Record(gtx.Ops)
 		dims := layout.Inset{Top: 5, Bottom: 5, Left: 10, Right: 11}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return row(gtx, 6, dot(c, 7), u.label(12, s, c))
+			dc := c
+			if c == colWarn { // "connecting" breathes
+				dc = withAlpha(c, uint8(110+145*pulse(gtx, 0.9)))
+			}
+			return row(gtx, 6, dot(dc, 7), u.label(12, s, c))
 		})
 		call := macro.Stop()
 		rrect(gtx, dims.Size, dims.Size.Y/2, withAlpha(c, 0x1f))
@@ -639,7 +644,9 @@ func dot(c color.NRGBA, d unit.Dp) layout.Widget {
 
 // segmented control
 func (u *ui) segmented(gtx layout.Context, sel int) layout.Dimensions {
+	pos := u.an.to(gtx, &u.gameBtns, float32(sel), 14) // the highlight slides
 	macro := op.Record(gtx.Ops)
+	var segSize image.Point
 	dims := layout.UniformInset(3).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		var ch []layout.FlexChild
 		for i := range gameOptions {
@@ -654,29 +661,44 @@ func (u *ui) segmented(gtx layout.Context, sel int) layout.Dimensions {
 						return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 							l := material.Label(u.th, 13, gameOptions[i].label)
 							l.Font.Weight = font.Medium
-							l.Color = colMuted
+							near := 1 - float32(math.Min(1, math.Abs(float64(pos)-float64(i))))
+							base := colMuted
+							if c.Hovered() && i != sel {
+								base = colText
+							}
+							l.Color = lerpC(base, colAccentD, near)
 							if i == sel {
-								l.Color = colAccentD
 								l.Font.Weight = font.SemiBold
-							} else if c.Hovered() {
-								l.Color = colText
 							}
 							return l.Layout(gtx)
 						})
 					})
 					call := macro.Stop()
-					if i == sel {
-						shadow(gtx, d.Size, d.Size.Y/2, 2, 0x38)
-						rrect(gtx, d.Size, d.Size.Y/2, colSelect)
-					} else if c.Hovered() {
-						rrect(gtx, d.Size, d.Size.Y/2, colHover)
+					segSize = d.Size
+					if i != sel {
+						hv := u.an.to(gtx, c, map[bool]float32{false: 0, true: 1}[c.Hovered()], 16)
+						if hv > 0.01 {
+							rrect(gtx, d.Size, d.Size.Y/2, withAlpha(colHover, uint8(float32(colHover.A)*hv)))
+						}
 					}
 					call.Add(gtx.Ops)
 					return d
 				})
 			}))
 		}
-		return layout.Flex{}.Layout(gtx, ch...)
+		// labels are recorded first so the sliding highlight can go underneath
+		rows := op.Record(gtx.Ops)
+		d := layout.Flex{}.Layout(gtx, ch...)
+		rowsCall := rows.Stop()
+		if segSize.X > 0 {
+			off := op.Offset(image.Pt(int(pos*float32(d.Size.X)/float32(len(gameOptions))+0.5), 0)).Push(gtx.Ops)
+			sz := image.Pt(d.Size.X/len(gameOptions), segSize.Y)
+			shadow(gtx, sz, sz.Y/2, 2, 0x38)
+			rrect(gtx, sz, sz.Y/2, colSelect)
+			off.Pop()
+		}
+		rowsCall.Add(gtx.Ops)
+		return d
 	})
 	call := macro.Stop()
 	glass(gtx, dims.Size, dims.Size.Y/2, segTrack, color.NRGBA{255, 255, 255, 0x1c})
@@ -695,9 +717,11 @@ func (u *ui) avatar(name string, talking bool) layout.Widget {
 		sz := gtx.Dp(36)
 		full := gtx.Dp(40)
 		inset := (full - sz) / 2
-		if talking { // green ring around whoever is talking
+		tk := u.an.to(gtx, "talk:"+name, map[bool]float32{false: 0, true: 1}[talking], 12)
+		if tk > 0.01 { // pulsing green ring around whoever is talking
+			glow := 0.65 + 0.35*pulse(gtx, 1.6)
 			path := clip.Ellipse(image.Rectangle{Min: image.Pt(1, 1), Max: image.Pt(full-1, full-1)}).Path(gtx.Ops)
-			paint.FillShape(gtx.Ops, colGood, clip.Stroke{Path: path, Width: float32(gtx.Dp(2))}.Op())
+			paint.FillShape(gtx.Ops, withAlpha(colGood, uint8(255*tk*glow)), clip.Stroke{Path: path, Width: float32(gtx.Dp(2))}.Op())
 		}
 		defer op.Offset(image.Pt(inset, inset)).Push(gtx.Ops).Pop()
 		cl := clip.Ellipse(image.Rectangle{Max: image.Pt(sz, sz)}).Push(gtx.Ops)
@@ -732,7 +756,15 @@ func initials(name string) string {
 }
 
 func (u *ui) bar(frac float32, c color.NRGBA, w unit.Dp) layout.Widget {
+	return u.barK(nil, frac, c, w)
+}
+
+// barK: like bar, but glides to new values when key is set.
+func (u *ui) barK(key any, frac float32, c color.NRGBA, w unit.Dp) layout.Widget {
 	return func(gtx layout.Context) layout.Dimensions {
+		if key != nil {
+			frac = u.an.to(gtx, key, frac, 14)
+		}
 		W, H := gtx.Dp(w), gtx.Dp(6)
 		if w == 0 {
 			W = gtx.Constraints.Max.X
@@ -780,6 +812,13 @@ func divider(gtx layout.Context) layout.Dimensions {
 func (u *ui) layout(gtx layout.Context) {
 	sections := []layout.Widget{u.header, u.gameCard, u.roomCard, u.voiceCard, u.lookCard, u.logCard, vgap(8)}
 	u.page.Layout(gtx, len(sections), func(gtx layout.Context, i int) layout.Dimensions {
+		t := u.an.intro(gtx, 0.05+0.07*float64(i), 0.45)
+		if t >= 1 {
+			return sections[i](gtx)
+		}
+		// slide up and fade in on startup, one card after another
+		defer paint.PushOpacity(gtx.Ops, t).Pop()
+		defer op.Offset(image.Pt(0, int((1-t)*float32(gtx.Dp(18))))).Push(gtx.Ops).Pop()
 		return sections[i](gtx)
 	})
 }
@@ -1047,7 +1086,7 @@ func (u *ui) memberRow(gtx layout.Context, m MemberInfo, vs VoiceStatus) layout.
 						gtx.Constraints = layout.Exact(image.Pt(sz, sz))
 						return icVolume.Layout(gtx, colFaint)
 					},
-					u.bar(float32(pv.Volume)/100, colAccent, 60),
+					u.barK(m.ID, float32(pv.Volume)/100, colAccent, 60),
 					u.label(12, fmt.Sprintf("%d%%", pv.Volume), colMuted),
 				)
 			}),
@@ -1116,7 +1155,7 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 						layout.Rigid(u.label(13.5, "Mic level", colText)),
 						layout.Rigid(layout.Spacer{Width: 12}.Layout),
-						layout.Flexed(1, u.bar(float32(vs.Level)/100, lvlC, 0)),
+						layout.Flexed(1, u.barK(&u.sens, float32(vs.Level)/100, lvlC, 0)),
 						layout.Rigid(layout.Spacer{Width: 12}.Layout),
 						layout.Rigid(u.label(12.5, status, lvlC)),
 					)
@@ -1291,6 +1330,7 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 			return field(gtx)
 		}
 		ws := []layout.Widget{field, vgap(4)}
+		fade := u.an.to(gtx, "open:"+title, 1, 14)
 		if len(list) <= 1 {
 			ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: 14, Top: 4}.Layout(gtx, u.caption("No other devices found."))
@@ -1300,6 +1340,7 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 			i := i
 			ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 				c := &opts[i]
+				defer paint.PushOpacity(gtx.Ops, fade).Pop()
 				return c.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 					pointer.CursorPointer.Add(gtx.Ops)
 					macro := op.Record(gtx.Ops)
