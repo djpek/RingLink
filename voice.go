@@ -34,6 +34,10 @@ const (
 	jitterMax    = 12 // drop old frames beyond this (240 ms)
 )
 
+// AudioDevice is a mic or output the user can pick. An empty ID means the
+// system default.
+type AudioDevice struct{ ID, Name string }
+
 // audio backends implement these (audio_*.go)
 type micSource interface {
 	Read(frame []int16) error // blocks until a full frame is captured
@@ -87,6 +91,8 @@ type Voice struct {
 	peers   map[uint64]*vpeer
 	myPos   *vec3
 	myGame  byte
+	micDev  string
+	spkDev  string
 	backend string
 	errText string
 
@@ -124,6 +130,21 @@ func (v *Voice) sender() func([]byte) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.send
+}
+
+// SetDevices picks the mic and output ("" = system default). If voice is on,
+// it restarts on the new devices.
+func (v *Voice) SetDevices(mic, spk string) {
+	v.mu.Lock()
+	changed := v.micDev != mic || v.spkDev != spk
+	v.micDev, v.spkDev = mic, spk
+	running := v.running
+	v.mu.Unlock()
+	if changed && running {
+		v.Stop()
+		time.Sleep(150 * time.Millisecond)
+		v.Start()
+	}
 }
 
 func (v *Voice) Running() bool {
@@ -227,12 +248,15 @@ func (v *Voice) Start() {
 	stop := v.stop
 	v.mu.Unlock()
 
-	mic, mname, err := openMic()
+	v.mu.Lock()
+	micDev, spkDev := v.micDev, v.spkDev
+	v.mu.Unlock()
+	mic, mname, err := openMic(micDev)
 	if err != nil {
 		v.fail("couldn't open the microphone: %v", err)
 		return
 	}
-	spk, sname, err := openSpeaker()
+	spk, sname, err := openSpeaker(spkDev)
 	if err != nil {
 		mic.Close()
 		v.fail("couldn't open the speakers: %v", err)

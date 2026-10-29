@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -76,14 +77,23 @@ var spkCmds = [][]string{
 	{"aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rateS, "-c", "1", "--buffer-time=80000"},
 }
 
-func startProc(cands [][]string, capture bool) (*procAudio, string, error) {
+func startProc(cands [][]string, capture bool, device string) (*procAudio, string, error) {
 	var lastErr error = errors.New("no audio tool found (install pulseaudio-utils, pipewire or alsa-utils)")
 	for _, c := range cands {
 		path, err := exec.LookPath(c[0])
 		if err != nil {
 			continue
 		}
-		cmd := exec.Command(path, c[1:]...)
+		args := append([]string(nil), c[1:]...)
+		if device != "" {
+			switch c[0] {
+			case "parec", "pacat":
+				args = append(args, "--device="+device)
+			case "pw-record", "pw-play":
+				args = append([]string{"--target", device}, args...)
+			}
+		}
+		cmd := exec.Command(path, args...)
 		p := &procAudio{cmd: cmd}
 		if capture {
 			p.r, err = cmd.StdoutPipe()
@@ -115,18 +125,66 @@ func startProc(cands [][]string, capture bool) (*procAudio, string, error) {
 	return nil, "", lastErr
 }
 
-func openMic() (micSource, string, error) {
-	p, name, err := startProc(micCmds, true)
+func openMic(device string) (micSource, string, error) {
+	p, name, err := startProc(micCmds, true, device)
 	if err != nil {
 		return nil, "", err
 	}
 	return p, name, nil
 }
 
-func openSpeaker() (speakerSink, string, error) {
-	p, name, err := startProc(spkCmds, false)
+func openSpeaker(device string) (speakerSink, string, error) {
+	p, name, err := startProc(spkCmds, false, device)
 	if err != nil {
 		return nil, "", err
 	}
 	return p, name, nil
+}
+
+// Device lists come from the sound server (PipeWire or PulseAudio) via pactl.
+// IDs are sound-server device names, which parec/pacat and pw-record/pw-play
+// both accept.
+
+func listMics() []AudioDevice     { return pactlList("sources", true) }
+func listSpeakers() []AudioDevice { return pactlList("sinks", false) }
+
+func pactlList(kind string, skipMonitors bool) []AudioDevice {
+	path, err := exec.LookPath("pactl")
+	if err != nil {
+		return nil
+	}
+	cmd := exec.Command(path, "list", kind)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return parsePactl(string(out), skipMonitors)
+}
+
+func parsePactl(out string, skipMonitors bool) []AudioDevice {
+	var devs []AudioDevice
+	var cur AudioDevice
+	flush := func() {
+		if cur.ID != "" && !(skipMonitors && strings.HasSuffix(cur.ID, ".monitor")) {
+			if cur.Name == "" {
+				cur.Name = cur.ID
+			}
+			devs = append(devs, cur)
+		}
+		cur = AudioDevice{}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Source #") || strings.HasPrefix(line, "Sink #"):
+			flush()
+		case strings.HasPrefix(t, "Name: ") && cur.ID == "":
+			cur.ID = strings.TrimPrefix(t, "Name: ")
+		case strings.HasPrefix(t, "Description: ") && cur.Name == "":
+			cur.Name = strings.TrimPrefix(t, "Description: ")
+		}
+	}
+	flush()
+	return devs
 }

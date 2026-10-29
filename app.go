@@ -19,6 +19,8 @@ type Settings struct {
 	Opacity     int    `json:"opacity,omitempty"`      // background (or window) opacity %, 0 = unset (100)
 	PanelAlpha  int    `json:"panelOpacity,omitempty"` // panels & buttons opacity % when see-through, 0 = unset (90)
 	Voice       *bool  `json:"voice,omitempty"`
+	MicDevice   string `json:"micDevice,omitempty"`
+	SpkDevice   string `json:"speakerDevice,omitempty"`
 	VoiceSens   int    `json:"voiceSens,omitempty"`
 	VoiceVol    *int   `json:"voiceVol,omitempty"`
 	VoiceRange  *int   `json:"voiceRange,omitempty"`
@@ -52,6 +54,7 @@ func NewApp(notify func()) *App {
 		a.Voice.Muffle.Store(int32(*a.S.VoiceMuff))
 	}
 	a.Voice.GameMode.Store(int32(a.S.Game))
+	a.Voice.SetDevices(a.S.MicDevice, a.S.SpkDevice)
 	if a.S.MaxPeople < 2 || a.S.MaxPeople > MaxRoomSize {
 		a.S.MaxPeople = 4
 	}
@@ -201,4 +204,10 @@ func (a *App) SetGame(g int) {
 	a.S.Game = g
 	a.Voice.GameMode.Store(int32(g))
 	a.Save()
+}
+
+func (a *App) SetDevices(mic, spk string) {
+	a.S.MicDevice, a.S.SpkDevice = mic, spk
+	a.Save()
+	go a.Voice.SetDevices(mic, spk)
 }

@@ -29,6 +29,10 @@ var (
 	pWaveOutWrite        = winmm.NewProc("waveOutWrite")
 	pWaveOutReset        = winmm.NewProc("waveOutReset")
 	pWaveOutClose        = winmm.NewProc("waveOutClose")
+	pWaveInGetNumDevs    = winmm.NewProc("waveInGetNumDevs")
+	pWaveInGetDevCapsW   = winmm.NewProc("waveInGetDevCapsW")
+	pWaveOutGetNumDevs   = winmm.NewProc("waveOutGetNumDevs")
+	pWaveOutGetDevCapsW  = winmm.NewProc("waveOutGetDevCapsW")
 )
 
 const (
@@ -117,13 +121,14 @@ type winMic struct {
 	next int
 }
 
-func openMic() (micSource, string, error) {
+func openMic(device string) (micSource, string, error) {
 	b, err := newWinBufs()
 	if err != nil {
 		return nil, "", err
 	}
 	m := &winMic{b: b}
-	r, _, _ := pWaveInOpen.Call(uintptr(unsafe.Pointer(&m.h)), waveMapper, uintptr(unsafe.Pointer(pcmFormat())), 0, 0, 0)
+	id, label := findDevice(listMics(), device, "Windows default mic")
+	r, _, _ := pWaveInOpen.Call(uintptr(unsafe.Pointer(&m.h)), id, uintptr(unsafe.Pointer(pcmFormat())), 0, 0, 0)
 	if err := mmErr("waveInOpen", r); err != nil {
 		b.free()
 		return nil, "", fmt.Errorf("%v (check Windows Settings > Privacy > Microphone allows desktop apps)", err)
@@ -136,7 +141,7 @@ func openMic() (micSource, string, error) {
 		m.Close()
 		return nil, "", mmErr("waveInStart", r)
 	}
-	return m, "Windows default mic", nil
+	return m, label, nil
 }
 
 func (m *winMic) Read(frame []int16) error {
@@ -182,13 +187,14 @@ type winSpk struct {
 	queued int
 }
 
-func openSpeaker() (speakerSink, string, error) {
+func openSpeaker(device string) (speakerSink, string, error) {
 	b, err := newWinBufs()
 	if err != nil {
 		return nil, "", err
 	}
 	s := &winSpk{b: b}
-	r, _, _ := pWaveOutOpen.Call(uintptr(unsafe.Pointer(&s.h)), waveMapper, uintptr(unsafe.Pointer(pcmFormat())), 0, 0, 0)
+	id, label := findDevice(listSpeakers(), device, "Windows default output")
+	r, _, _ := pWaveOutOpen.Call(uintptr(unsafe.Pointer(&s.h)), id, uintptr(unsafe.Pointer(pcmFormat())), 0, 0, 0)
 	if err := mmErr("waveOutOpen", r); err != nil {
 		b.free()
 		return nil, "", err
@@ -197,7 +203,7 @@ func openSpeaker() (speakerSink, string, error) {
 		pWaveOutPrepare.Call(s.h, uintptr(unsafe.Pointer(h)), unsafe.Sizeof(*h))
 		h.Flags |= whdrDone // all free at start
 	}
-	return s, "Windows default output", nil
+	return s, label, nil
 }
 
 func (s *winSpk) Write(frame []int16) error {
@@ -233,4 +239,47 @@ func (s *winSpk) Close() {
 	}
 	pWaveOutClose.Call(h)
 	s.b.free()
+}
+
+// ---------- device lists ----------
+// Devices are identified by name (indexes change when things are plugged in).
+
+type waveCaps struct {
+	Mid, Pid      uint16
+	DriverVersion uint32
+	Pname         [32]uint16
+	Formats       uint32
+	Channels      uint16
+	Reserved1     uint16
+	Support       uint32 // waveOut only; harmless extra space for waveIn
+}
+
+func listWave(num, caps *windows.LazyProc) []AudioDevice {
+	n, _, _ := num.Call()
+	var out []AudioDevice
+	for i := uintptr(0); i < n; i++ {
+		var c waveCaps
+		if r, _, _ := caps.Call(i, uintptr(unsafe.Pointer(&c)), unsafe.Sizeof(c)); r != 0 {
+			continue
+		}
+		name := windows.UTF16ToString(c.Pname[:])
+		out = append(out, AudioDevice{ID: name, Name: name})
+	}
+	return out
+}
+
+func listMics() []AudioDevice     { return listWave(pWaveInGetNumDevs, pWaveInGetDevCapsW) }
+func listSpeakers() []AudioDevice { return listWave(pWaveOutGetNumDevs, pWaveOutGetDevCapsW) }
+
+// findDevice turns a saved device name into a winmm device index; unknown or
+// empty names use the Windows default.
+func findDevice(list []AudioDevice, want, def string) (uintptr, string) {
+	if want != "" {
+		for i, d := range list {
+			if d.ID == want {
+				return uintptr(i), d.Name
+			}
+		}
+	}
+	return waveMapper, def
 }

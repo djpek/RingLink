@@ -97,6 +97,8 @@ var (
 	icVolume  = mustIcon(icons.AVVolumeUp)
 	icPower   = mustIcon(icons.ActionPowerSettingsNew)
 	icRestore = mustIcon(icons.ActionRestore)
+	icExpand  = mustIcon(icons.NavigationExpandMore)
+	icLess    = mustIcon(icons.NavigationExpandLess)
 )
 
 var gameOptions = []struct {
@@ -123,6 +125,10 @@ type ui struct {
 	copiedAt                   time.Time
 	showLog                    bool
 	backdrop                   paint.ImageOp
+	micSel, spkSel             widget.Clickable
+	micOpen, spkOpen           bool
+	micList, spkList           []AudioDevice
+	micOpts, spkOpts           []widget.Clickable
 	view                       app.ViewEvent
 	opacityF, panelF           widget.Float
 	appliedOpacity             int
@@ -144,6 +150,10 @@ func runUI() {
 	u.codeEd.SingleLine = true
 	u.nameEd.SetText(u.app.S.DisplayName)
 	u.sens.Value = float32(u.app.Voice.Sens.Load()) / 100
+	u.micList = append([]AudioDevice{{"", "System default"}}, listMics()...)
+	u.spkList = append([]AudioDevice{{"", "System default"}}, listSpeakers()...)
+	u.micOpts = make([]widget.Clickable, len(u.micList))
+	u.spkOpts = make([]widget.Clickable, len(u.spkList))
 	u.opacityF.Value = float32(u.opacity()) / 100
 	u.panelF.Value = float32(u.panelOpacity()) / 100
 	u.syncFX()
@@ -247,6 +257,32 @@ func (u *ui) update(gtx layout.Context) {
 		}
 		if !u.panelF.Dragging() {
 			a.Save()
+		}
+	}
+	if u.micSel.Clicked(gtx) {
+		u.micOpen, u.spkOpen = !u.micOpen, false
+		if u.micOpen {
+			u.micList = append([]AudioDevice{{"", "System default"}}, listMics()...)
+			u.micOpts = make([]widget.Clickable, len(u.micList))
+		}
+	}
+	if u.spkSel.Clicked(gtx) {
+		u.spkOpen, u.micOpen = !u.spkOpen, false
+		if u.spkOpen {
+			u.spkList = append([]AudioDevice{{"", "System default"}}, listSpeakers()...)
+			u.spkOpts = make([]widget.Clickable, len(u.spkList))
+		}
+	}
+	for i := range u.micOpts {
+		if u.micOpts[i].Clicked(gtx) {
+			a.SetDevices(u.micList[i].ID, a.S.SpkDevice)
+			u.micOpen = false
+		}
+	}
+	for i := range u.spkOpts {
+		if u.spkOpts[i].Clicked(gtx) {
+			a.SetDevices(a.S.MicDevice, u.spkList[i].ID)
+			u.spkOpen = false
 		}
 	}
 	if u.logBtn.Clicked(gtx) {
@@ -1040,6 +1076,13 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 		if vs.Err != "" && !vs.On && inRoom {
 			ws = append(ws, u.label(13, vs.Err, colBad), vgap(10))
 		}
+		ws = append(ws,
+			u.sectionLabel("Devices"),
+			u.devicePicker(&u.micSel, icMic, "Microphone", u.app.S.MicDevice, u.micOpen, u.micList, u.micOpts),
+			vgap(8),
+			u.devicePicker(&u.spkSel, icHeadset, "Output", u.app.S.SpkDevice, u.spkOpen, u.spkList, u.spkOpts),
+			divider,
+		)
 		if inRoom {
 			muteIc, muteLbl, muteKind := icMic, "Mute mic", btnSecondary
 			if muted {
@@ -1183,4 +1226,120 @@ func (u *ui) lookCard(gtx layout.Context) layout.Dimensions {
 			u.caption(note),
 		)
 	})
+}
+
+// devicePicker: a field showing the chosen device; click to open the list.
+func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current string, open bool, list []AudioDevice, opts []widget.Clickable) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		label := "System default"
+		if current != "" {
+			label = current
+			for _, d := range list {
+				if d.ID == current {
+					label = d.Name
+				}
+			}
+			if label == current {
+				// saved device isn't plugged in right now
+				label = shortDevice(current) + " (not found)"
+			}
+		}
+		field := func(gtx layout.Context) layout.Dimensions {
+			return sel.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				pointer.CursorPointer.Add(gtx.Ops)
+				macro := op.Record(gtx.Ops)
+				d := layout.Inset{Top: 10, Bottom: 10, Left: 14, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					gtx.Constraints.Min.X = gtx.Constraints.Max.X
+					return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							sz := gtx.Dp(17)
+							gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+							return ic.Layout(gtx, colAccent)
+						}),
+						layout.Rigid(layout.Spacer{Width: 10}.Layout),
+						layout.Rigid(u.label(13, title, colMuted)),
+						layout.Rigid(layout.Spacer{Width: 10}.Layout),
+						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+							l := material.Label(u.th, 14, label)
+							l.MaxLines = 1
+							l.Truncator = "…"
+							l.Alignment = text.End
+							return l.Layout(gtx)
+						}),
+						layout.Rigid(layout.Spacer{Width: 6}.Layout),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							sz := gtx.Dp(20)
+							gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+							if open {
+								return icLess.Layout(gtx, colMuted)
+							}
+							return icExpand.Layout(gtx, colMuted)
+						}),
+					)
+				})
+				call := macro.Stop()
+				bg := colField
+				if sel.Hovered() {
+					bg = colHover
+				}
+				glass(gtx, d.Size, gtx.Dp(12), bg, color.NRGBA{255, 255, 255, 0x1c})
+				call.Add(gtx.Ops)
+				return d
+			})
+		}
+		if !open {
+			return field(gtx)
+		}
+		ws := []layout.Widget{field, vgap(4)}
+		if len(list) <= 1 {
+			ws = append(ws, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Left: 14, Top: 4}.Layout(gtx, u.caption("No other devices found."))
+			})
+		}
+		for i := range list {
+			i := i
+			ws = append(ws, func(gtx layout.Context) layout.Dimensions {
+				c := &opts[i]
+				return c.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					pointer.CursorPointer.Add(gtx.Ops)
+					macro := op.Record(gtx.Ops)
+					d := layout.Inset{Top: 8, Bottom: 8, Left: 14, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						gtx.Constraints.Min.X = gtx.Constraints.Max.X
+						return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+								l := material.Label(u.th, 13.5, list[i].Name)
+								l.MaxLines = 1
+								l.Truncator = "…"
+								return l.Layout(gtx)
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								if list[i].ID != current {
+									return layout.Dimensions{}
+								}
+								sz := gtx.Dp(17)
+								gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+								return icCheck.Layout(gtx, colAccent)
+							}),
+						)
+					})
+					call := macro.Stop()
+					if c.Hovered() {
+						rrect(gtx, d.Size, gtx.Dp(10), colHover)
+					}
+					call.Add(gtx.Ops)
+					return d
+				})
+			})
+		}
+		return col(gtx, ws...)
+	}
+}
+
+// shortDevice makes a raw sound-server name a bit friendlier.
+func shortDevice(id string) string {
+	id = strings.TrimPrefix(strings.TrimPrefix(id, "alsa_input."), "alsa_output.")
+	if len(id) > 40 {
+		id = id[:40] + "…"
+	}
+	return id
 }

@@ -19,6 +19,8 @@ Voice starts automatically once you're in a room. When you're on the same LMU se
 
 Under **Appearance** you can make RingLink see-through. On Linux (X11, e.g. Linux Mint) only the background goes see-through, with separate sliders for the background and for panels & buttons; desktops that support it (KDE Plasma) also blur what's behind. On Windows the whole window fades.
 
+Pick your **microphone** and **output** in the Voice panel (or leave them on System default).
+
 You can set how loud everyone is, how far voices carry, how muffled they get with distance, and your mic sensitivity.
 
 ### Game setup
@@ -36,7 +38,7 @@ Use headphones so nobody hears themselves echo.
 - **Rooms:** the room code is the only thing you share. Each member posts a small announcement (name and network address) to a topic on [ntfy.sh](https://ntfy.sh), a free public message relay. The topic name and the encryption key both come from the room code (Argon2id + XChaCha20-Poly1305), so the relay only ever sees ciphertext.
 - **Voice:** everyone connects directly to everyone else with UDP hole punching (STUN to find public addresses). Audio is 16 kHz mono G.711 mu-law in 20 ms frames, encrypted with the room key. Nothing goes through a server.
 - **Proximity:** each app reads its own car position (LMU REST API or BeamNG MotionSim UDP) and shares it with the room. Distances are only compared between people in the same game.
-- **Audio I/O:** Windows uses winmm (no extra installs). Linux uses `parec`/`pacat`, `pw-record`/`pw-play` or `arecord`/`aplay`, whichever is installed.
+- **Audio I/O:** Windows uses winmm (no extra installs). Linux uses `parec`/`pacat`, `pw-record`/`pw-play` or `arecord`/`aplay`, whichever is installed; device lists come from `pactl`.
 
 Anyone with a room's code can join it, so only share codes with people you want in.
 

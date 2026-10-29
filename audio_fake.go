@@ -34,5 +34,12 @@ type fakeSpkDev struct{}
 func (fakeSpkDev) Write(f []int16) error { time.Sleep(20 * time.Millisecond); return nil }
 func (fakeSpkDev) Close()                {}
 
-func openMic() (micSource, string, error)       { return &fakeMicDev{}, "test mic", nil }
-func openSpeaker() (speakerSink, string, error) { return fakeSpkDev{}, "test output", nil }
+func openMic(string) (micSource, string, error)       { return &fakeMicDev{}, "test mic", nil }
+func openSpeaker(string) (speakerSink, string, error) { return fakeSpkDev{}, "test output", nil }
+
+func listMics() []AudioDevice {
+	return []AudioDevice{{"usb-mic", "USB Microphone"}, {"headset-mic", "Headset Microphone"}}
+}
+func listSpeakers() []AudioDevice {
+	return []AudioDevice{{"speakers", "Speakers"}, {"headset", "Headset"}}
+}
