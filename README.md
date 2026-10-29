@@ -43,4 +43,6 @@ UI built with [Gio](https://gioui.org).
 
 ## License
 
-MIT - see [LICENSE](LICENSE). Use it however you like, just keep the copyright notice.
+[PolyForm Noncommercial 1.0.0](LICENSE): free to use, change and share for any **noncommercial** purpose. You may not sell RingLink or use it commercially. Anyone who shares it or a changed version must include the license and this notice:
+
+> Required Notice: Copyright (c) 2026 djpek (https://github.com/djpek/RingLink)
