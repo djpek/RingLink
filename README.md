@@ -2,6 +2,12 @@
 
 Proximity voice chat for **Le Mans Ultimate** and **BeamNG.drive**: the closer someone's car is to yours, the louder they are. Further away they fade out and can be muffled, like you're actually hearing them on track.
 
+<p align="center">
+  <img src="docs/room.png" width="380" alt="RingLink in a room with two other people">
+  &nbsp;
+  <img src="docs/lobby.png" width="380" alt="Creating or joining a room">
+</p>
+
 ## How to use
 
 1. Open RingLink (`RingLink.exe` on Windows, `ringlink-linux` on Linux).
@@ -14,6 +20,9 @@ Voice starts automatically once you're in a room. When you're on the same LMU se
 You can set how loud everyone is, how far voices carry, how muffled they get with distance, and your mic sensitivity.
 
 ### Game setup
+
+Pick your game at the top of the window: **Auto** (whichever game you're driving in), **Le Mans Ultimate** or **BeamNG**.
+
 
 - **Le Mans Ultimate:** nothing to set up. RingLink reads your car position from LMU's local REST API (`127.0.0.1:6397`).
 - **BeamNG.drive / BeamMP:** in *Options > Other*, turn on **MotionSim** with IP `127.0.0.1` and port `4444`.
@@ -39,7 +48,11 @@ go build -o ringlink-linux .                                                  # 
 GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui" -o RingLink.exe .  # Windows
 ```
 
-UI built with [Gio](https://gioui.org).
+For screenshots or testing without a microphone, build with `-tags fakeaudio`: the mic "talks" every few seconds and sound output is discarded.
+
+UI built with [Gio](https://gioui.org), using the [SN Pro](https://github.com/supernotes/sn-pro) font (SIL Open Font License 1.1, see `fonts/OFL.txt`).
+
+<p align="center"><img src="docs/three-people.png" alt="Three people in one room"></p>
 
 ## License
 

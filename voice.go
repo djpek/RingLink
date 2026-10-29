@@ -90,6 +90,7 @@ type Voice struct {
 	backend string
 	errText string
 
+	GameMode atomic.Int32 // gameNone = auto, gameLMU, gameBeamNG
 	Muted    atomic.Bool
 	Sens     atomic.Int32 // 0..100, higher = more sensitive
 	VolPct   atomic.Int32 // everyone's volume, 0..200 %
@@ -516,11 +517,17 @@ func (v *Voice) posLoop(stop chan struct{}) {
 		// BeamNG only sends while you're driving, so a recent packet wins;
 		// otherwise ask LMU.
 		var game byte
-		pos := bng.recent(time.Second)
-		if pos != nil {
-			game = gameBeamNG
-		} else if pos = readLMUPos(cl); pos != nil {
-			game = gameLMU
+		var pos *vec3
+		mode := byte(v.GameMode.Load())
+		if mode != gameLMU {
+			if pos = bng.recent(time.Second); pos != nil {
+				game = gameBeamNG
+			}
+		}
+		if pos == nil && mode != gameBeamNG {
+			if pos = readLMUPos(cl); pos != nil {
+				game = gameLMU
+			}
 		}
 		v.mu.Lock()
 		v.myPos, v.myGame = pos, game

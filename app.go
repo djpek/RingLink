@@ -15,6 +15,7 @@ const appVersion = "3.0"
 type Settings struct {
 	DisplayName string `json:"displayName"`
 	MaxPeople   int    `json:"maxPeople"`
+	Game        int    `json:"game"` // 0 auto, 1 LMU, 2 BeamNG
 	Voice       *bool  `json:"voice,omitempty"`
 	VoiceSens   int    `json:"voiceSens,omitempty"`
 	VoiceVol    *int   `json:"voiceVol,omitempty"`
@@ -48,6 +49,7 @@ func NewApp(notify func()) *App {
 	if a.S.VoiceMuff != nil {
 		a.Voice.Muffle.Store(int32(*a.S.VoiceMuff))
 	}
+	a.Voice.GameMode.Store(int32(a.S.Game))
 	if a.S.MaxPeople < 2 || a.S.MaxPeople > MaxRoomSize {
 		a.S.MaxPeople = 4
 	}
@@ -191,4 +193,10 @@ func (a *App) LeaveRoom() {
 	r.Leave()
 	a.Log("Left room %s.", r.Code)
 	a.poke()
+}
+
+func (a *App) SetGame(g int) {
+	a.S.Game = g
+	a.Voice.GameMode.Store(int32(g))
+	a.Save()
 }
