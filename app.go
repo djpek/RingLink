@@ -15,7 +15,8 @@ const appVersion = "3.0"
 type Settings struct {
 	DisplayName string `json:"displayName"`
 	MaxPeople   int    `json:"maxPeople"`
-	Game        int    `json:"game"` // 0 auto, 1 LMU, 2 BeamNG
+	Game        int    `json:"game"`              // 0 auto, 1 LMU, 2 BeamNG
+	Opacity     int    `json:"opacity,omitempty"` // window opacity %, 0 = fully opaque
 	Voice       *bool  `json:"voice,omitempty"`
 	VoiceSens   int    `json:"voiceSens,omitempty"`
 	VoiceVol    *int   `json:"voiceVol,omitempty"`

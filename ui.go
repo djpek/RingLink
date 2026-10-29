@@ -102,6 +102,10 @@ type ui struct {
 	copiedAt                   time.Time
 	showLog                    bool
 	backdrop                   paint.ImageOp
+	view                       app.ViewEvent
+	opacityF                   widget.Float
+	appliedOpacity             int
+	opacityOK                  bool
 }
 
 func runUI() {
@@ -119,6 +123,7 @@ func runUI() {
 	u.codeEd.SingleLine = true
 	u.nameEd.SetText(u.app.S.DisplayName)
 	u.sens.Value = float32(u.app.Voice.Sens.Load()) / 100
+	u.opacityF.Value = float32(u.opacity()-50) / 50
 	u.syncFX()
 	go func() {
 		for range time.Tick(250 * time.Millisecond) {
@@ -132,7 +137,11 @@ func runUI() {
 			u.app.Save()
 			u.app.LeaveRoom()
 			return
+		case app.ViewEvent:
+			u.view = e
+			u.appliedOpacity = -1
 		case app.FrameEvent:
+			u.applyOpacity()
 			gtx := app.NewContext(&ops, e)
 			paint.Fill(gtx.Ops, colBg)
 			u.drawBackdrop(gtx)
@@ -199,6 +208,12 @@ func (u *ui) update(gtx layout.Context) {
 	}
 	if u.muteBtn.Clicked(gtx) {
 		a.Voice.Muted.Store(!a.Voice.Muted.Load())
+	}
+	if u.opacityF.Update(gtx) {
+		a.S.Opacity = 50 + int(u.opacityF.Value*50+0.5)
+		if !u.opacityF.Dragging() {
+			a.Save()
+		}
 	}
 	if u.logBtn.Clicked(gtx) {
 		u.showLog = !u.showLog
@@ -279,7 +294,32 @@ func glass(gtx layout.Context, sz image.Point, r int, fill, edge color.NRGBA) {
 	paint.FillShape(gtx.Ops, edge, clip.Stroke{Path: path, Width: float32(gtx.Dp(1))}.Op())
 }
 
+func (u *ui) opacity() int {
+	o := u.app.S.Opacity
+	if o <= 0 || o > 100 {
+		return 100
+	}
+	if o < 50 {
+		return 50
+	}
+	return o
+}
+
+func (u *ui) applyOpacity() {
+	o := u.opacity()
+	if u.view == nil || o == u.appliedOpacity {
+		return
+	}
+	u.appliedOpacity = o
+	u.opacityOK = setWindowOpacity(u.view, float64(o)/100)
+}
+
 func (u *ui) drawBackdrop(gtx layout.Context) {
+	if u.opacity() < 100 && u.opacityOK {
+		// see-through window: a plain dark tint reads best over the desktop
+		paint.Fill(gtx.Ops, rgb(0x12161c))
+		return
+	}
 	sz := u.backdrop.Size()
 	W, H := gtx.Constraints.Max.X, gtx.Constraints.Max.Y
 	sc := float32(W) / float32(sz.X)
@@ -640,7 +680,7 @@ func divider(gtx layout.Context) layout.Dimensions {
 // ---------- page ----------
 
 func (u *ui) layout(gtx layout.Context) {
-	sections := []layout.Widget{u.header, u.gameCard, u.roomCard, u.voiceCard, u.logCard, vgap(8)}
+	sections := []layout.Widget{u.header, u.gameCard, u.roomCard, u.voiceCard, u.lookCard, u.logCard, vgap(8)}
 	u.page.Layout(gtx, len(sections), func(gtx layout.Context, i int) layout.Dimensions {
 		return sections[i](gtx)
 	})
@@ -1057,3 +1097,16 @@ func (u *ui) logCard(gtx layout.Context) layout.Dimensions {
 }
 
 func f32Scale(s float32) f32.Affine2D { return f32.Affine2D{}.Scale(f32.Point{}, f32.Pt(s, s)) }
+
+func (u *ui) lookCard(gtx layout.Context) layout.Dimensions {
+	return u.card(gtx, icTune, "Appearance", nil, func(gtx layout.Context) layout.Dimensions {
+		note := "Lower it to see your desktop through the window."
+		if u.view != nil && !u.opacityOK {
+			note = "Your desktop doesn't support see-through windows (e.g. Wayland), so this has no effect."
+		}
+		return col(gtx,
+			u.sliderRow("Window opacity", fmt.Sprintf("%d%%", u.opacity()), &u.opacityF),
+			u.caption(note),
+		)
+	})
+}
