@@ -40,3 +40,7 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui" -o RingLink.exe .  #
 ```
 
 UI built with [Gio](https://gioui.org).
+
+## License
+
+MIT - see [LICENSE](LICENSE). Use it however you like, just keep the copyright notice.
