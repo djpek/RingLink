@@ -124,7 +124,7 @@ type ui struct {
 	gameBtns                   [3]widget.Clickable
 	sens, vol, rng, muff       widget.Float
 	baseMuff, doppler          widget.Float
-	dirBtn                     widget.Clickable
+	dirBtn, replayBtn          widget.Clickable
 	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
 	copiedAt                   time.Time
@@ -341,6 +341,12 @@ func (u *ui) update(gtx layout.Context) {
 		a.Voice.Doppler.Store(int32(x))
 		a.S.VoiceDop = &x
 		save = !u.doppler.Dragging()
+	}
+	if u.replayBtn.Clicked(gtx) {
+		on := !a.Voice.Replay.Enabled()
+		a.Voice.Replay.SetEnabled(on)
+		a.S.ReplayVoice = &on
+		save = true
 	}
 	if u.dirBtn.Clicked(gtx) {
 		on := !a.Voice.Direct.Load()
@@ -1236,6 +1242,18 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 			vgap(10),
 			u.sliderRow("Doppler effect", fmt.Sprintf("%d%%", v.Doppler.Load()), &u.doppler),
 			u.caption(dopplerDesc(v.Doppler.Load())),
+			vgap(10),
+			func(gtx layout.Context) layout.Dimensions {
+				lbl, kind := "Off", btnGhost
+				if v.Replay.Enabled() {
+					lbl, kind = "On", btnPrimary
+				}
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, u.label(13.5, "Voice in replays", colText)),
+					layout.Rigid(u.button(&u.replayBtn, icList, lbl, kind, false)),
+				)
+			},
+			u.caption(replayCaption(v.Replay)),
 			vgap(12),
 			u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."),
 		)
@@ -1550,5 +1568,20 @@ func dopplerDesc(d int32) string {
 		return "About as strong as real life: noticeable at big speed differences."
 	default:
 		return "Exaggerated, more than real life."
+	}
+}
+
+func replayCaption(r *ReplayVoice) string {
+	if !r.Enabled() {
+		return "Off: voice chat isn't saved."
+	}
+	rec, inReplay := r.Status()
+	switch {
+	case inReplay:
+		return "Watching a replay: playing back what was said at this moment."
+	case rec:
+		return "Recording voice chat so LMU replays play it back in sync."
+	default:
+		return "Saves voice chat while you drive in LMU and plays it back in sync when you watch the replay."
 	}
 }

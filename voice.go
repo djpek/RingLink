@@ -205,6 +205,7 @@ type Voice struct {
 	BaseMuff atomic.Int32 // 0..100: muffle applied to everyone all the time (helmet / radio feel)
 	Doppler  atomic.Int32 // 0..100: pitch shift from closing speed (100 = realistic)
 	Direct   atomic.Bool  // pan voices left/right by where their car is relative to yours
+	Replay   *ReplayVoice // voice in game replays
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
 	seq      uint16
@@ -212,7 +213,7 @@ type Voice struct {
 }
 
 func NewVoice(logf func(string, ...any), notify func()) *Voice {
-	v := &Voice{logf: logf, notify: notify, peers: map[uint64]*vpeer{}}
+	v := &Voice{logf: logf, notify: notify, peers: map[uint64]*vpeer{}, Replay: NewReplayVoice()}
 	v.Sens.Store(60)
 	v.VolPct.Store(100)
 	v.RangeM.Store(150)
@@ -436,6 +437,7 @@ func (v *Voice) Start() {
 	go v.captureLoop(mic, stop)
 	go v.playLoop(spk, stop)
 	go v.posLoop(stop)
+	v.Replay.Run(stop)
 	v.notify()
 }
 
@@ -542,6 +544,7 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 				pkt[3+i] = linearToULaw(s)
 			}
 			send(pkt)
+			v.Replay.Record(0, pkt[3:])
 		}
 	}
 }
@@ -600,6 +603,13 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 		}
 		if v.running {
 			p.queue = append(p.queue, fr)
+			if v.Replay.Enabled() {
+				ul := make([]byte, voiceFrame)
+				for i, x := range fr {
+					ul[i] = linearToULaw(x)
+				}
+				v.Replay.Record(from, ul)
+			}
 			if len(p.queue) > jitterMax {
 				p.queue = p.queue[len(p.queue)-jitterTarget:]
 			}
@@ -692,6 +702,16 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 				mixR[i] += x * math.Min(math.Sin(th)*math.Sqrt2, 1.25)
 			}
 			p.gain, p.lpA, p.pan = j.gain, a, j.pan
+		}
+		// voices recorded during this moment of the replay you're watching (centred)
+		if rf := v.Replay.Frames(now); len(rf) > 0 {
+			g := float64(v.VolPct.Load()) / 100
+			for _, fr := range rf {
+				for i, x := range fr {
+					mixL[i] += float64(x) * g
+					mixR[i] += float64(x) * g
+				}
+			}
 		}
 		for i := range mixL {
 			for c, x := range [2]float64{mixL[i], mixR[i]} {

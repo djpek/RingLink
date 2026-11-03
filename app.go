@@ -28,6 +28,7 @@ type Settings struct {
 	VoiceBase   *int   `json:"voiceBaseMuffle,omitempty"`
 	VoiceDir    *bool  `json:"voiceDirectional,omitempty"`
 	VoiceDop    *int   `json:"voiceDoppler,omitempty"`
+	ReplayVoice *bool  `json:"replayVoice,omitempty"`
 }
 
 type App struct {
@@ -64,6 +65,9 @@ func NewApp(notify func()) *App {
 	}
 	if a.S.VoiceDop != nil {
 		a.Voice.Doppler.Store(int32(*a.S.VoiceDop))
+	}
+	if a.S.ReplayVoice != nil {
+		a.Voice.Replay.SetEnabled(*a.S.ReplayVoice)
 	}
 	a.Voice.GameMode.Store(int32(a.S.Game))
 	a.Voice.SetDevices(a.S.MicDevice, a.S.SpkDevice)
