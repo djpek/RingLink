@@ -38,7 +38,8 @@ var (
 const (
 	waveMapper   = 0xFFFFFFFF
 	whdrDone     = 0x1
-	nBufs        = 4
+	nBufs        = 8 // mic buffers (20 ms each); the speaker only queues spkBufs
+	spkBufs      = 4
 	mmsyserrNone = 0
 )
 
@@ -119,6 +120,7 @@ type winMic struct {
 	h    uintptr
 	b    *winBufs
 	next int
+	pend []int16 // recorded samples not handed out yet
 }
 
 func openMic(device string) (micSource, string, error) {
@@ -144,23 +146,37 @@ func openMic(device string) (micSource, string, error) {
 	return m, label, nil
 }
 
+// Read hands out exactly one frame. Windows doesn't always return full buffers, so
+// only the samples it says it recorded are used (assuming full buffers played the
+// untouched, silent half of a buffer and made voices choppy).
 func (m *winMic) Read(frame []int16) error {
-	h := m.b.hdrs[m.next]
 	deadline := time.Now().Add(2 * time.Second)
-	for h.Flags&whdrDone == 0 {
-		if m.h == 0 {
-			return errors.New("closed")
+	for len(m.pend) < len(frame) {
+		h := m.b.hdrs[m.next]
+		for h.Flags&whdrDone == 0 {
+			if m.h == 0 {
+				return errors.New("closed")
+			}
+			if time.Now().After(deadline) {
+				return errors.New("microphone isn't delivering audio")
+			}
+			time.Sleep(2 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			return errors.New("microphone isn't delivering audio")
+		n := int(h.BytesRecorded / 2)
+		if n > len(m.b.data[m.next]) {
+			n = len(m.b.data[m.next])
 		}
-		time.Sleep(3 * time.Millisecond)
+		m.pend = append(m.pend, m.b.data[m.next][:n]...)
+		h.Flags &^= whdrDone
+		h.BytesRecorded = 0
+		pWaveInAddBuffer.Call(m.h, uintptr(unsafe.Pointer(h)), unsafe.Sizeof(*h))
+		m.next = (m.next + 1) % nBufs
 	}
-	copy(frame, m.b.data[m.next])
-	h.Flags &^= whdrDone
-	h.BytesRecorded = 0
-	pWaveInAddBuffer.Call(m.h, uintptr(unsafe.Pointer(h)), unsafe.Sizeof(*h))
-	m.next = (m.next + 1) % nBufs
+	copy(frame, m.pend)
+	m.pend = append(m.pend[:0], m.pend[len(frame):]...)
+	if len(m.pend) > 4*len(frame) { // fell behind: keep only the newest sound
+		m.pend = append(m.pend[:0], m.pend[len(m.pend)-len(frame):]...)
+	}
 	return nil
 }
 
@@ -223,7 +239,7 @@ func (s *winSpk) Write(frame []int16) error {
 	if r, _, _ := pWaveOutWrite.Call(s.h, uintptr(unsafe.Pointer(h)), unsafe.Sizeof(*h)); r != 0 {
 		return mmErr("waveOutWrite", r)
 	}
-	s.next = (s.next + 1) % nBufs
+	s.next = (s.next + 1) % spkBufs
 	return nil
 }
 
