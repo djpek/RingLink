@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
+	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -80,5 +84,39 @@ func TestReplayStampsEvenWithSteppedClock(t *testing.T) {
 		if d := ets[i] - ets[i-1]; d < 0.019 || d > 0.021 {
 			t.Fatalf("frame %d spaced %.3f s from the previous one", i, d)
 		}
+	}
+}
+
+// Two sessions on the same track whose clocks overlap: the replay's span picks the right one,
+// even after a restart (only the files are there).
+func TestReplayPicksTheRightSession(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, from, to float64, tag byte) {
+		var b []byte
+		for et := from; et < to; et += 0.02 {
+			f := make([]byte, recFrameBytes)
+			binary.LittleEndian.PutUint64(f, math.Float64bits(et))
+			binary.LittleEndian.PutUint32(f[16:], math.Float32bits(float32(math.NaN())))
+			for k := 28; k < recFrameBytes; k++ {
+				f[k] = tag
+			}
+			b = append(b, f...)
+		}
+		os.WriteFile(filepath.Join(dir, name), b, 0o644)
+	}
+	write("2026-11-01_20-00-00_Nordschleife.rlv2", 100, 1700, 1) // older race, 100..1700 s
+	write("2026-11-03_14-00-00_Nordschleife.rlv2", 300, 500, 2)  // newer short practice, 300..500 s
+	write("2026-11-03_15-00-00_Spa.rlv2", 100, 1700, 3)          // other track
+	r := NewReplayVoice()
+	r.dir = dir
+	r.track = "Nordschleife"
+	r.rpStart, r.rpLen = 90, 1620 // watching the old race
+	if !r.ensureLoadedLocked(400) || r.frames[0].data[0] != 1 {
+		t.Fatalf("race replay loaded %q", r.loaded)
+	}
+	r.loadTry = time.Time{}
+	r.rpStart, r.rpLen = 290, 220 // now the practice
+	if !r.ensureLoadedLocked(400) || r.frames[0].data[0] != 2 {
+		t.Fatalf("practice replay loaded %q", r.loaded)
 	}
 }

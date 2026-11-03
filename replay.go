@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -61,6 +62,9 @@ type ReplayVoice struct {
 	rpET    float64 // session ET shown by the replay at rpAt
 	rpAt    time.Time
 	rpSpeed float64
+	rpStart float64 // the replay's first session ET and length: tells which session it is
+	rpLen   float64
+	loadKey string // replay (track, start, length) the loaded recording was picked for
 	// loaded recording for playback
 	loaded     string
 	frames     []recFrame // sorted by et
@@ -183,11 +187,15 @@ func (r *ReplayVoice) replayLoop(stop chan struct{}) {
 				Body struct {
 					Start float64 `json:"replayStartET"`
 					Pos   float64 `json:"currentReplayPos"`
+					Len   float64 `json:"replayLength"`
 				} `json:"body"`
 			}
 			if json.Unmarshal([]byte(msg), &m) != nil {
 				continue
 			}
+			r.mu.Lock()
+			r.rpStart, r.rpLen = m.Body.Start, m.Body.Len
+			r.mu.Unlock()
 			r.onReplayPos(m.Body.Start+m.Body.Pos, time.Now())
 		}
 		ws.Close()
@@ -357,27 +365,62 @@ func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 	return out
 }
 
-// ensureLoadedLocked loads the newest recording that covers session time t
-// (rescanning at most every 3 s, and re-reading the file still being recorded).
+// ensureLoadedLocked picks the recording made during the session this replay shows.
+// Every session's clock starts near zero, so time alone can't tell sessions apart:
+// recordings must be from the same track and fit inside the replay's time span,
+// and the one that fills the span best wins (newest on a tie). Works after
+// restarting the game or RingLink, since recordings are files.
 func (r *ReplayVoice) ensureLoadedLocked(t float64) bool {
+	key := fmt.Sprintf("%s|%.0f|%.0f", safeName(r.track), r.rpStart, r.rpLen)
 	n := len(r.frames)
-	if n > 0 && t >= r.frames[0].et-30 && t <= r.frames[n-1].et+30 {
+	if n > 0 && key == r.loadKey && t >= r.frames[0].et-30 && t <= r.frames[n-1].et+30 {
 		return true
 	}
 	if time.Since(r.loadTry) < 3*time.Second {
-		return false
+		return n > 0 && key == r.loadKey && t >= r.frames[0].et-30 && t <= r.frames[n-1].et+30
 	}
 	r.loadTry = time.Now()
+	r.frames, r.loaded = nil, ""
 	m, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv2"))
-	sort.Sort(sort.Reverse(sort.StringSlice(m)))
+	best, bestScore := "", -1.0
+	var bestFr []recFrame
+	sameTrack := 0
 	for _, p := range m {
-		fr := readRecording(p)
-		if len(fr) > 0 && t >= fr[0].et-30 && t <= fr[len(fr)-1].et+30 {
-			r.loaded, r.frames, r.cursor = p, fr, sort.Search(len(fr), func(i int) bool { return fr[i].et >= t })
-			return true
+		if strings.HasSuffix(filepath.Base(p), "_"+safeName(r.track)+".rlv2") {
+			sameTrack++
 		}
 	}
-	return false
+	for _, p := range m {
+		// only this track's recordings (unless LMU didn't give a name we have files for)
+		if r.track != "" && sameTrack > 0 && !strings.HasSuffix(filepath.Base(p), "_"+safeName(r.track)+".rlv2") {
+			continue
+		}
+		fr := readRecording(p)
+		if len(fr) == 0 || t < fr[0].et-30 || t > fr[len(fr)-1].et+30 {
+			continue
+		}
+		score := 1.0
+		if r.rpLen > 0 { // how much of the recording lies inside the replay
+			a, b := fr[0].et, fr[len(fr)-1].et
+			lo, hi := math.Max(a, r.rpStart-5), math.Min(b, r.rpStart+r.rpLen+5)
+			inside := math.Max(0, hi-lo) / math.Max(1, b-a)
+			if inside < 0.5 {
+				continue // mostly outside this replay: another session
+			}
+			// and how much of the replay it spans (talk only covers part, but the right
+			// session's recording almost always spans the most)
+			score = inside + math.Min(1, (b-a)/r.rpLen)
+		}
+		if score > bestScore+1e-9 || math.Abs(score-bestScore) <= 1e-9 && p > best {
+			best, bestScore, bestFr = p, score, fr
+		}
+	}
+	if best == "" {
+		return false
+	}
+	r.loaded, r.frames, r.loadKey = best, bestFr, key
+	r.cursor = sort.Search(len(bestFr), func(i int) bool { return bestFr[i].et >= t })
+	return true
 }
 
 func readRecording(p string) []recFrame {
