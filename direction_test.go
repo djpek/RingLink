@@ -54,3 +54,33 @@ func TestLegacyFramesUpsampled(t *testing.T) {
 		t.Fatalf("legacy frame not decoded to %d samples: %d frames", voiceFrame, len(q))
 	}
 }
+
+func TestDopplerPitch(t *testing.T) {
+	v := NewVoice(func(string, ...any) {}, func() {})
+	p := &vpeer{}
+	now := time.Now()
+	r := 1.0
+	for i := 0; i < 60; i++ { // closing at 40 m/s, distance sampled every 0.2 s
+		now = now.Add(200 * time.Millisecond)
+		r = p.dopplerRateLocked(600-float64(i)*8, now, 1)
+	}
+	if r < 1.10 || r > 1.13 { // 1 + 40/343
+		t.Fatalf("closing at 40 m/s gave rate %.3f", r)
+	}
+	// resampler keeps producing full frames and drains the queue faster
+	for i := 0; i < 10; i++ {
+		f := make([]int16, voiceFrame)
+		for k := range f {
+			f[k] = int16(k)
+		}
+		p.queue = append(p.queue, f)
+	}
+	got := 0
+	for p.nextFrameLocked(r) != nil {
+		got++
+	}
+	if got < 8 || got > 9 { // 10 frames / 1.117
+		t.Fatalf("got %d frames at rate %.3f", got, r)
+	}
+	_ = v
+}

@@ -123,7 +123,7 @@ type ui struct {
 	minusBtn, plusBtn, logBtn  widget.Clickable
 	gameBtns                   [3]widget.Clickable
 	sens, vol, rng, muff       widget.Float
-	baseMuff                   widget.Float
+	baseMuff, doppler          widget.Float
 	dirBtn                     widget.Clickable
 	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
@@ -198,6 +198,7 @@ func (u *ui) syncFX() {
 	u.rng.Value = float32(v.RangeM.Load()-20) / 480
 	u.muff.Value = float32(v.Muffle.Load()) / 100
 	u.baseMuff.Value = float32(v.BaseMuff.Load()) / 100
+	u.doppler.Value = float32(v.Doppler.Load()) / 200
 }
 
 // ---------- input ----------
@@ -335,6 +336,12 @@ func (u *ui) update(gtx layout.Context) {
 		a.S.VoiceBase = &x
 		save = !u.baseMuff.Dragging()
 	}
+	if u.doppler.Update(gtx) {
+		x := int(u.doppler.Value*200 + 0.5)
+		a.Voice.Doppler.Store(int32(x))
+		a.S.VoiceDop = &x
+		save = !u.doppler.Dragging()
+	}
 	if u.dirBtn.Clicked(gtx) {
 		on := !a.Voice.Direct.Load()
 		a.Voice.Direct.Store(on)
@@ -342,12 +349,13 @@ func (u *ui) update(gtx layout.Context) {
 		save = true
 	}
 	if u.resetFX.Clicked(gtx) {
-		a.S.VoiceVol, a.S.VoiceRange, a.S.VoiceMuff, a.S.VoiceBase, a.S.VoiceDir = nil, nil, nil, nil, nil
+		a.S.VoiceVol, a.S.VoiceRange, a.S.VoiceMuff, a.S.VoiceBase, a.S.VoiceDir, a.S.VoiceDop = nil, nil, nil, nil, nil, nil
 		a.Voice.VolPct.Store(100)
 		a.Voice.RangeM.Store(150)
 		a.Voice.Muffle.Store(50)
 		a.Voice.BaseMuff.Store(0)
 		a.Voice.Direct.Store(true)
+		a.Voice.Doppler.Store(50)
 		u.syncFX()
 		save = true
 	}
@@ -356,7 +364,7 @@ func (u *ui) update(gtx layout.Context) {
 	}
 	// save once a drag on any slider ends
 	dragging := false
-	for _, f := range []*widget.Float{&u.sens, &u.vol, &u.rng, &u.muff, &u.baseMuff, &u.opacityF, &u.panelF} {
+	for _, f := range []*widget.Float{&u.sens, &u.vol, &u.rng, &u.muff, &u.baseMuff, &u.doppler, &u.opacityF, &u.panelF} {
 		dragging = dragging || f.Dragging()
 	}
 	if u.wasDragging && !dragging {
@@ -1225,6 +1233,9 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 				)
 			},
 			u.caption("Voices come from where their car is: left, right or behind you. Uses your car's direction (head turning in VR isn't tracked)."),
+			vgap(10),
+			u.sliderRow("Doppler effect", fmt.Sprintf("%d%%", v.Doppler.Load()), &u.doppler),
+			u.caption(dopplerDesc(v.Doppler.Load())),
 			vgap(12),
 			u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."),
 		)
@@ -1527,4 +1538,17 @@ func (u *ui) slider(gtx layout.Context, f *widget.Float) layout.Dimensions {
 	ki.Pop()
 	ko.Pop()
 	return layout.Dimensions{Size: image.Pt(w, h)}
+}
+
+func dopplerDesc(d int32) string {
+	switch {
+	case d == 0:
+		return "Off."
+	case d < 70:
+		return "Voices pitch up a little when a car closes on you and down as it pulls away."
+	case d <= 110:
+		return "About as strong as real life: noticeable at big speed differences."
+	default:
+		return "Exaggerated, more than real life."
+	}
 }

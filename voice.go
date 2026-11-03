@@ -82,6 +82,99 @@ type vpeer struct {
 	lp1, lp2 float64
 	lpA      float64
 	pan      float64 // -1 left .. +1 right, playback goroutine only
+
+	// Doppler (playback goroutine, under v.mu): resampler state and closing speed
+	rs      []float64 // decoded samples not yet played
+	ph      float64   // fractional read position in rs
+	rate    float64   // current playback rate (1 = normal)
+	lastD   float64
+	lastDAt time.Time
+	closing float64 // m/s, positive when the cars are getting closer
+}
+
+const soundSpeed = 343.0
+
+// nextFrameLocked returns the next 20 ms of this peer's voice, played at rate r
+// (r > 1 = higher pitch, consumes audio a little faster), or nil when they're silent.
+func (p *vpeer) nextFrameLocked(r float64) []int16 {
+	if p.priming && len(p.queue) >= jitterTarget {
+		p.priming = false
+	}
+	if p.priming {
+		return nil
+	}
+	if r == 1 && p.ph == 0 && len(p.rs) == 0 { // no Doppler: frames straight through
+		if len(p.queue) == 0 {
+			p.priming = true // ran dry: rebuffer before their next sentence
+			return nil
+		}
+		fr := p.queue[0]
+		p.queue = p.queue[1:]
+		return fr
+	}
+	need := int(p.ph+r*float64(voiceFrame-1)) + 2
+	for len(p.rs) < need && len(p.queue) > 0 {
+		for _, x := range p.queue[0] {
+			p.rs = append(p.rs, float64(x))
+		}
+		p.queue = p.queue[1:]
+	}
+	if len(p.rs) < need {
+		p.priming, p.rs, p.ph = true, p.rs[:0], 0
+		return nil
+	}
+	out := make([]int16, voiceFrame)
+	ph := p.ph
+	for i := range out {
+		k := int(ph)
+		t := ph - float64(k)
+		out[i] = int16(p.rs[k] + (p.rs[k+1]-p.rs[k])*t)
+		ph += r
+	}
+	drop := int(ph)
+	n := copy(p.rs, p.rs[drop:])
+	p.rs, p.ph = p.rs[:n], ph-float64(drop)
+	if p.rate == 1 && math.Abs(r-1) < 1e-9 && p.ph < 1e-6 && len(p.rs) == 0 {
+		p.ph = 0
+	}
+	return out
+}
+
+// dopplerRateLocked tracks how fast this peer's car closes on yours and turns it
+// into a playback rate. amount: 0 = off, 1 = physically realistic.
+func (p *vpeer) dopplerRateLocked(d float64, now time.Time, amount float64) float64 {
+	if d < 0 {
+		p.closing *= 0.9
+		p.lastDAt = time.Time{}
+	} else if d != p.lastD {
+		if !p.lastDAt.IsZero() {
+			if dt := now.Sub(p.lastDAt).Seconds(); dt > 0.02 && dt < 1.5 {
+				v := (p.lastD - d) / dt
+				if v > 120 {
+					v = 120
+				} else if v < -120 {
+					v = -120
+				}
+				p.closing = 0.6*p.closing + 0.4*v
+			}
+		}
+		p.lastD, p.lastDAt = d, now
+	} else if now.Sub(p.lastDAt) > 1500*time.Millisecond {
+		p.closing *= 0.9 // positions stopped updating
+	}
+	target := 1.0
+	if amount > 0 {
+		target = 1 + amount*p.closing/soundSpeed
+		target = math.Max(0.75, math.Min(1.33, target))
+	}
+	if p.rate == 0 {
+		p.rate = 1
+	}
+	p.rate += (target - p.rate) * 0.15 // glide so pitch never jumps
+	if amount == 0 && math.Abs(p.rate-1) < 0.002 {
+		p.rate = 1
+	}
+	return p.rate
 }
 
 type Voice struct {
@@ -110,6 +203,7 @@ type Voice struct {
 	RangeM   atomic.Int32 // distance (m) where voices fade to silence
 	Muffle   atomic.Int32 // 0..100: how muffled voices get with distance
 	BaseMuff atomic.Int32 // 0..100: muffle applied to everyone all the time (helmet / radio feel)
+	Doppler  atomic.Int32 // 0..100: pitch shift from closing speed (100 = realistic)
 	Direct   atomic.Bool  // pan voices left/right by where their car is relative to yours
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
@@ -124,6 +218,7 @@ func NewVoice(logf func(string, ...any), notify func()) *Voice {
 	v.RangeM.Store(150)
 	v.Muffle.Store(50)
 	v.Direct.Store(true)
+	v.Doppler.Store(50)
 	return v
 }
 
@@ -549,18 +644,11 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 		}
 		jobs = jobs[:0]
 		v.mu.Lock()
+		now := time.Now()
+		dop := float64(v.Doppler.Load()) / 100
 		for _, p := range v.peers {
-			var fr []int16
-			if p.priming && len(p.queue) >= jitterTarget {
-				p.priming = false
-			}
-			if !p.priming && len(p.queue) > 0 {
-				fr = p.queue[0]
-				p.queue = p.queue[1:]
-			} else if !p.priming {
-				p.priming = true // ran dry: rebuffer before their next sentence
-			}
 			d := v.distLocked(p)
+			fr := p.nextFrameLocked(p.dopplerRateLocked(d, now, dop))
 			pan, behind := v.dirLocked(p)
 			m := v.muffleFor(d)
 			m = 1 - (1-m)*(1-0.3*behind) // voices from behind you are a bit duller

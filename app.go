@@ -27,6 +27,7 @@ type Settings struct {
 	VoiceMuff   *int   `json:"voiceMuffle,omitempty"`
 	VoiceBase   *int   `json:"voiceBaseMuffle,omitempty"`
 	VoiceDir    *bool  `json:"voiceDirectional,omitempty"`
+	VoiceDop    *int   `json:"voiceDoppler,omitempty"`
 }
 
 type App struct {
@@ -60,6 +61,9 @@ func NewApp(notify func()) *App {
 	}
 	if a.S.VoiceDir != nil {
 		a.Voice.Direct.Store(*a.S.VoiceDir)
+	}
+	if a.S.VoiceDop != nil {
+		a.Voice.Doppler.Store(int32(*a.S.VoiceDop))
 	}
 	a.Voice.GameMode.Store(int32(a.S.Game))
 	a.Voice.SetDevices(a.S.MicDevice, a.S.SpkDevice)
