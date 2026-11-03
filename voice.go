@@ -77,6 +77,7 @@ type vpeer struct {
 	pos      *vec3
 	game     byte
 	posSeen  time.Time
+	mt       motion // their car's movement, for guessing where it is now
 	talkAt   time.Time
 	gain     float64 // playback goroutine only
 	lp1, lp2 float64
@@ -190,6 +191,7 @@ type Voice struct {
 	broadcast bool              // in the garage / watching a replay: you're heard at full volume, centred
 	myPos     *vec3
 	myGame    byte
+	me        motion     // your car's movement
 	myHead    [2]float64 // unit heading in the horizontal plane (from how the car moves)
 	haveHead  bool
 	headAt    [2]float64 // position the heading was last measured from
@@ -323,7 +325,12 @@ func (v *Voice) distLocked(p *vpeer) float64 {
 	if v.myPos == nil || p.pos == nil || p.game != v.myGame || time.Since(p.posSeen) > 3*time.Second {
 		return -1
 	}
-	dx, dy, dz := v.myPos.X-p.pos.X, v.myPos.Y-p.pos.Y, v.myPos.Z-p.pos.Z
+	now := time.Now()
+	a, b := v.mePosLocked(now), p.mt.now(now)
+	if b == nil {
+		b = p.pos
+	}
+	dx, dy, dz := a.X-b.X, a.Y-b.Y, a.Z-b.Z
 	return math.Sqrt(dx*dx + dy*dy + dz*dz)
 }
 
@@ -370,7 +377,20 @@ func (v *Voice) dirLocked(p *vpeer) (pan, behind float64) {
 	if !v.haveHead || v.myPos == nil || p.pos == nil || p.game != v.myGame || time.Since(p.posSeen) > 3*time.Second {
 		return 0, 0
 	}
-	return v.dirFrom(v.myPos, v.myHead, v.myGame, p.pos)
+	now := time.Now()
+	b := p.mt.now(now)
+	if b == nil {
+		b = p.pos
+	}
+	return v.dirFrom(v.mePosLocked(now), v.myHead, v.myGame, b)
+}
+
+// mePosLocked: where your car most likely is right now.
+func (v *Voice) mePosLocked(now time.Time) *vec3 {
+	if p := v.me.now(now); p != nil {
+		return p
+	}
+	return v.myPos
 }
 
 // dirFrom: where src is relative to a listener at pos heading head.
@@ -663,6 +683,7 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 			p.pos, p.game = nil, gameNone
 		}
 		p.posSeen = time.Now()
+		p.mt.update(p.pos, p.game, p.posSeen)
 		v.mu.Unlock()
 	}
 }
@@ -834,7 +855,7 @@ type lmuState struct {
 func (v *Voice) posLoop(stop chan struct{}) {
 	cl := &http.Client{Timeout: 400 * time.Millisecond}
 	bng := startBeamNGListener(stop, v.logf)
-	t := time.NewTicker(200 * time.Millisecond)
+	t := time.NewTicker(100 * time.Millisecond) // LMU updates positions every 200 ms: catch each one quickly
 	defer t.Stop()
 	for {
 		select {
@@ -866,14 +887,24 @@ func (v *Voice) posLoop(stop chan struct{}) {
 				}
 			}
 		}
+		_ = vel // LMU's carVelocity can be relative to the car, so the heading comes from movement
+		now := time.Now()
 		v.mu.Lock()
-		if vel != nil && game == gameLMU && math.Hypot(vel.X, vel.Z) > 1.5 {
-			n := math.Hypot(vel.X, vel.Z) // LMU tells us which way the car is going
-			v.myHead, v.haveHead, v.headAt = [2]float64{vel.X / n, vel.Z / n}, true, horiz(pos, game)
-		} else {
-			v.trackHeadingLocked(pos, game, v.myGame)
+		v.me.update(pos, game, now)
+		if h, ok := v.me.heading(); ok {
+			if v.haveHead && game == v.myGame { // smooth a little so wiggles don't swing voices around
+				h = [2]float64{0.7*h[0] + 0.3*v.myHead[0], 0.7*h[1] + 0.3*v.myHead[1]}
+				n := math.Hypot(h[0], h[1])
+				h = [2]float64{h[0] / n, h[1] / n}
+			}
+			v.myHead, v.haveHead = h, true
+		} else if pos == nil || game != v.myGame {
+			v.haveHead = false
 		}
 		v.myPos, v.myGame, v.broadcast = pos, game, broadcast
+		if pos != nil {
+			pos = v.me.now(now) // send where the car is now, not where LMU last said it was
+		}
 		v.mu.Unlock()
 		if send := v.sender(); send != nil {
 			if pos == nil || v.Broadcasting() {

@@ -72,6 +72,7 @@ type ReplayVoice struct {
 	// the car the replay camera is following (the listener while watching)
 	lisPos  *vec3
 	lisHead [2]float64
+	lisMot  motion
 	lisOK   bool
 }
 
@@ -90,12 +91,13 @@ func (r *ReplayVoice) SetListener(pos, vel *vec3, inReplay bool) {
 		r.lisPos, r.lisOK = nil, false
 		return
 	}
-	if vel != nil {
-		if n := math.Hypot(vel.X, vel.Z); n > 1.5 {
-			r.lisHead, r.lisOK = [2]float64{vel.X / n, vel.Z / n}, true
-		}
+	_ = vel // can be relative to the car: use how the camera car moves instead
+	now := time.Now()
+	r.lisMot.update(pos, gameLMU, now)
+	if h, ok := r.lisMot.heading(); ok {
+		r.lisHead, r.lisOK = h, true
 	}
-	r.lisPos = pos
+	r.lisPos = r.lisMot.now(now)
 }
 
 // Listener: the replay camera car's position and heading (ok=false if unknown).
