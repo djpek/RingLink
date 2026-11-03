@@ -123,6 +123,8 @@ type ui struct {
 	minusBtn, plusBtn, logBtn  widget.Clickable
 	gameBtns                   [3]widget.Clickable
 	sens, vol, rng, muff       widget.Float
+	baseMuff                   widget.Float
+	dirBtn                     widget.Clickable
 	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
 	copiedAt                   time.Time
@@ -195,6 +197,7 @@ func (u *ui) syncFX() {
 	u.vol.Value = float32(v.VolPct.Load()) / 200
 	u.rng.Value = float32(v.RangeM.Load()-20) / 480
 	u.muff.Value = float32(v.Muffle.Load()) / 100
+	u.baseMuff.Value = float32(v.BaseMuff.Load()) / 100
 }
 
 // ---------- input ----------
@@ -326,11 +329,25 @@ func (u *ui) update(gtx layout.Context) {
 		a.S.VoiceMuff = &x
 		save = !u.muff.Dragging()
 	}
+	if u.baseMuff.Update(gtx) {
+		x := int(u.baseMuff.Value*100 + 0.5)
+		a.Voice.BaseMuff.Store(int32(x))
+		a.S.VoiceBase = &x
+		save = !u.baseMuff.Dragging()
+	}
+	if u.dirBtn.Clicked(gtx) {
+		on := !a.Voice.Direct.Load()
+		a.Voice.Direct.Store(on)
+		a.S.VoiceDir = &on
+		save = true
+	}
 	if u.resetFX.Clicked(gtx) {
-		a.S.VoiceVol, a.S.VoiceRange, a.S.VoiceMuff = nil, nil, nil
+		a.S.VoiceVol, a.S.VoiceRange, a.S.VoiceMuff, a.S.VoiceBase, a.S.VoiceDir = nil, nil, nil, nil, nil
 		a.Voice.VolPct.Store(100)
 		a.Voice.RangeM.Store(150)
 		a.Voice.Muffle.Store(50)
+		a.Voice.BaseMuff.Store(0)
+		a.Voice.Direct.Store(true)
 		u.syncFX()
 		save = true
 	}
@@ -339,7 +356,7 @@ func (u *ui) update(gtx layout.Context) {
 	}
 	// save once a drag on any slider ends
 	dragging := false
-	for _, f := range []*widget.Float{&u.sens, &u.vol, &u.rng, &u.muff, &u.opacityF, &u.panelF} {
+	for _, f := range []*widget.Float{&u.sens, &u.vol, &u.rng, &u.muff, &u.baseMuff, &u.opacityF, &u.panelF} {
 		dragging = dragging || f.Dragging()
 	}
 	if u.wasDragging && !dragging {
@@ -1193,6 +1210,21 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 			vgap(10),
 			u.sliderRow("Muffle with distance", fmt.Sprintf("%d%%", v.Muffle.Load()), &u.muff),
 			u.caption(capitalize(muffleDesc(v.Muffle.Load()))+"."),
+			vgap(10),
+			u.sliderRow("Always muffled", fmt.Sprintf("%d%%", v.BaseMuff.Load()), &u.baseMuff),
+			u.caption("Muffles everyone all the time, like talking through helmets or a team radio."),
+			vgap(10),
+			func(gtx layout.Context) layout.Dimensions {
+				lbl, kind := "Off", btnGhost
+				if v.Direct.Load() {
+					lbl, kind = "On", btnPrimary
+				}
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, u.label(13.5, "Directional sound", colText)),
+					layout.Rigid(u.button(&u.dirBtn, icHeadset, lbl, kind, false)),
+				)
+			},
+			u.caption("Voices come from where their car is: left, right or behind you. Uses your car's direction (head turning in VR isn't tracked)."),
 			vgap(12),
 			u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."),
 		)

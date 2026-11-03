@@ -24,6 +24,7 @@ type procAudio struct {
 	r    io.ReadCloser
 	w    io.WriteCloser
 	rf   *os.File // our end of the pipe (for backlog checks / pipe sizing)
+	ch   int      // channels (speaker: stereo)
 	buf  []byte
 	done chan struct{}
 
@@ -73,7 +74,11 @@ func (p *procAudio) Write(frame []int16) error {
 	if ahead > playAhead {
 		time.Sleep(ahead - playAhead)
 	}
-	p.written += int64(len(frame))
+	ch := p.ch
+	if ch < 1 {
+		ch = 1
+	}
+	p.written += int64(len(frame) / ch)
 	_, err := p.w.Write(p.buf)
 	return err
 }
@@ -99,9 +104,9 @@ var micCmds = [][]string{
 }
 
 var spkCmds = [][]string{
-	{"pacat", "--playback", "--raw", "--format=s16le", "--rate=" + rateS, "--channels=1", "--latency-msec=60", "--client-name=RingLink", "--stream-name=Voice chat"},
-	{"pw-play", "--rate", rateS, "--channels", "1", "--format", "s16", "--latency", "60ms", "-"},
-	{"aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rateS, "-c", "1", "--buffer-time=80000"},
+	{"pacat", "--playback", "--raw", "--format=s16le", "--rate=" + rateS, "--channels=2", "--latency-msec=60", "--client-name=RingLink", "--stream-name=Voice chat"},
+	{"pw-play", "--rate", rateS, "--channels", "2", "--format", "s16", "--latency", "60ms", "-"},
+	{"aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rateS, "-c", "2", "--buffer-time=80000"},
 }
 
 func startProc(cands [][]string, capture bool, device string) (*procAudio, string, error) {
@@ -171,6 +176,7 @@ func openSpeaker(device string) (speakerSink, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	p.ch = spkChannels
 	return p, name, nil
 }
 

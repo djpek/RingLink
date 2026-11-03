@@ -39,7 +39,6 @@ const (
 	waveMapper   = 0xFFFFFFFF
 	whdrDone     = 0x1
 	nBufs        = 4
-	frameBytes   = voiceFrame * 2
 	mmsyserrNone = 0
 )
 
@@ -64,9 +63,9 @@ type waveHdr struct {
 	Reserved      uintptr
 }
 
-func pcmFormat() *waveFormatEx {
-	return &waveFormatEx{FormatTag: 1, Channels: 1, SamplesPerSec: voiceRate,
-		AvgBytesPerSec: voiceRate * 2, BlockAlign: 2, BitsPerSample: 16}
+func pcmFormat(ch int) *waveFormatEx {
+	return &waveFormatEx{FormatTag: 1, Channels: uint16(ch), SamplesPerSec: voiceRate,
+		AvgBytesPerSec: uint32(voiceRate * 2 * ch), BlockAlign: uint16(2 * ch), BitsPerSample: 16}
 }
 
 // buffers live in memory allocated outside the Go heap so Windows can write
@@ -77,7 +76,8 @@ type winBufs struct {
 	data [nBufs][]int16
 }
 
-func newWinBufs() (*winBufs, error) {
+func newWinBufs(samples int) (*winBufs, error) {
+	frameBytes := uintptr(samples * 2)
 	hsz := unsafe.Sizeof(waveHdr{})
 	total := uintptr(nBufs) * (hsz + frameBytes)
 	mem, err := windows.VirtualAlloc(0, total, windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_READWRITE)
@@ -89,9 +89,9 @@ func newWinBufs() (*winBufs, error) {
 		h := (*waveHdr)(unsafe.Pointer(mem + uintptr(i)*hsz))
 		d := mem + uintptr(nBufs)*hsz + uintptr(i)*frameBytes
 		h.Data = d
-		h.BufferLength = frameBytes
+		h.BufferLength = uint32(frameBytes)
 		b.hdrs[i] = h
-		b.data[i] = unsafe.Slice((*int16)(unsafe.Pointer(d)), voiceFrame)
+		b.data[i] = unsafe.Slice((*int16)(unsafe.Pointer(d)), samples)
 	}
 	return b, nil
 }
@@ -122,13 +122,13 @@ type winMic struct {
 }
 
 func openMic(device string) (micSource, string, error) {
-	b, err := newWinBufs()
+	b, err := newWinBufs(voiceFrame)
 	if err != nil {
 		return nil, "", err
 	}
 	m := &winMic{b: b}
 	id, label := findDevice(listMics(), device, "Windows default mic")
-	r, _, _ := pWaveInOpen.Call(uintptr(unsafe.Pointer(&m.h)), id, uintptr(unsafe.Pointer(pcmFormat())), 0, 0, 0)
+	r, _, _ := pWaveInOpen.Call(uintptr(unsafe.Pointer(&m.h)), id, uintptr(unsafe.Pointer(pcmFormat(1))), 0, 0, 0)
 	if err := mmErr("waveInOpen", r); err != nil {
 		b.free()
 		return nil, "", fmt.Errorf("%v (check Windows Settings > Privacy > Microphone allows desktop apps)", err)
@@ -188,13 +188,13 @@ type winSpk struct {
 }
 
 func openSpeaker(device string) (speakerSink, string, error) {
-	b, err := newWinBufs()
+	b, err := newWinBufs(voiceFrame * spkChannels)
 	if err != nil {
 		return nil, "", err
 	}
 	s := &winSpk{b: b}
 	id, label := findDevice(listSpeakers(), device, "Windows default output")
-	r, _, _ := pWaveOutOpen.Call(uintptr(unsafe.Pointer(&s.h)), id, uintptr(unsafe.Pointer(pcmFormat())), 0, 0, 0)
+	r, _, _ := pWaveOutOpen.Call(uintptr(unsafe.Pointer(&s.h)), id, uintptr(unsafe.Pointer(pcmFormat(spkChannels))), 0, 0, 0)
 	if err := mmErr("waveOutOpen", r); err != nil {
 		b.free()
 		return nil, "", err

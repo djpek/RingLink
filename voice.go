@@ -26,12 +26,15 @@ import (
 )
 
 const (
-	voiceRate    = 16000
-	voiceFrame   = 320 // samples per 20 ms
-	vkAudio      = 1
+	voiceRate    = 24000
+	voiceFrame   = 480 // samples per 20 ms
+	vkAudio      = 1   // old 16 kHz frames (320 samples), still understood
+	vkAudio24    = 3   // 24 kHz frames (480 samples)
+	legacyFrame  = 320
 	vkPos        = 2
 	jitterTarget = 3  // frames buffered before a talker starts playing (60 ms)
 	jitterMax    = 12 // drop old frames beyond this (240 ms)
+	spkChannels  = 2  // stereo out, so voices can come from the left or right
 )
 
 // AudioDevice is a mic or output the user can pick. An empty ID means the
@@ -78,6 +81,7 @@ type vpeer struct {
 	gain     float64 // playback goroutine only
 	lp1, lp2 float64
 	lpA      float64
+	pan      float64 // -1 left .. +1 right, playback goroutine only
 }
 
 type Voice struct {
@@ -85,16 +89,19 @@ type Voice struct {
 	logf   func(string, ...any)
 	notify func()
 
-	mu      sync.Mutex
-	running bool
-	stop    chan struct{}
-	peers   map[uint64]*vpeer
-	myPos   *vec3
-	myGame  byte
-	micDev  string
-	spkDev  string
-	backend string
-	errText string
+	mu       sync.Mutex
+	running  bool
+	stop     chan struct{}
+	peers    map[uint64]*vpeer
+	myPos    *vec3
+	myGame   byte
+	myHead   [2]float64 // unit heading in the horizontal plane (from how the car moves)
+	haveHead bool
+	headAt   [2]float64 // position the heading was last measured from
+	micDev   string
+	spkDev   string
+	backend  string
+	errText  string
 
 	GameMode atomic.Int32 // gameNone = auto, gameLMU, gameBeamNG
 	Muted    atomic.Bool
@@ -102,6 +109,8 @@ type Voice struct {
 	VolPct   atomic.Int32 // everyone's volume, 0..200 %
 	RangeM   atomic.Int32 // distance (m) where voices fade to silence
 	Muffle   atomic.Int32 // 0..100: how muffled voices get with distance
+	BaseMuff atomic.Int32 // 0..100: muffle applied to everyone all the time (helmet / radio feel)
+	Direct   atomic.Bool  // pan voices left/right by where their car is relative to yours
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
 	seq      uint16
@@ -114,6 +123,7 @@ func NewVoice(logf func(string, ...any), notify func()) *Voice {
 	v.VolPct.Store(100)
 	v.RangeM.Store(150)
 	v.Muffle.Store(50)
+	v.Direct.Store(true)
 	return v
 }
 
@@ -228,12 +238,74 @@ func (v *Voice) gainFor(d float64) float64 {
 
 // muffleFor: 0 = clear, 1 = as muffled as the Muffle setting allows at max.
 func (v *Voice) muffleFor(d float64) float64 {
-	return farFrac(d, float64(v.RangeM.Load())) * float64(v.Muffle.Load()) / 100
+	m := farFrac(d, float64(v.RangeM.Load())) * float64(v.Muffle.Load()) / 100
+	b := float64(v.BaseMuff.Load()) / 100
+	return 1 - (1-m)*(1-b) // the constant muffle stacks with the distance one
 }
 
-// cutoff for the low-pass filter: ~7.5 kHz (clear) down to ~250 Hz (behind a wall).
+// horiz: the two horizontal axes of a game's world (LMU is y-up, BeamNG is z-up)
+func horiz(p *vec3, game byte) [2]float64 {
+	if game == gameBeamNG {
+		return [2]float64{p.X, p.Y}
+	}
+	return [2]float64{p.X, p.Z}
+}
+
+// dirLocked: where a peer is relative to your car. pan is -1 (left) .. +1 (right),
+// behind is 0 (in front or beside) .. 1 (straight behind). Zero when unknown.
+func (v *Voice) dirLocked(p *vpeer) (pan, behind float64) {
+	if !v.Direct.Load() || !v.haveHead || v.myPos == nil || p.pos == nil || p.game != v.myGame || time.Since(p.posSeen) > 3*time.Second {
+		return 0, 0
+	}
+	a, b := horiz(v.myPos, v.myGame), horiz(p.pos, p.game)
+	dx, dz := b[0]-a[0], b[1]-a[1]
+	l := math.Hypot(dx, dz)
+	if l < 1 {
+		return 0, 0
+	}
+	dx, dz = dx/l, dz/l
+	f := v.myHead
+	// both games: facing +forward, right-hand side is (f.z, -f.x)
+	pan = dx*f[1] - dz*f[0]
+	if fw := dx*f[0] + dz*f[1]; fw < 0 {
+		behind = -fw
+	}
+	return pan, behind
+}
+
+// trackHeading updates your heading from the car's movement (needs ~1.5 m of travel)
+func (v *Voice) trackHeadingLocked(pos *vec3, game byte, prevGame byte) {
+	if pos == nil {
+		return
+	}
+	h := horiz(pos, game)
+	if game != prevGame || !v.haveHead && v.headAt == [2]float64{} {
+		v.headAt = h
+		if game != prevGame {
+			v.haveHead = false
+		}
+		return
+	}
+	dx, dz := h[0]-v.headAt[0], h[1]-v.headAt[1]
+	l := math.Hypot(dx, dz)
+	if l > 50 { // teleported (reset to pits etc.)
+		v.headAt, v.haveHead = h, false
+		return
+	}
+	if l >= 1.5 {
+		nx, nz := dx/l, dz/l
+		if v.haveHead { // smooth a little so wiggles don't swing voices around
+			nx, nz = 0.6*nx+0.4*v.myHead[0], 0.6*nz+0.4*v.myHead[1]
+			n := math.Hypot(nx, nz)
+			nx, nz = nx/n, nz/n
+		}
+		v.myHead, v.haveHead, v.headAt = [2]float64{nx, nz}, true, h
+	}
+}
+
+// cutoff for the low-pass filter: ~11 kHz (clear) down to ~250 Hz (behind a wall).
 func muffleCutoff(m float64) float64 {
-	return 7500 * math.Pow(250.0/7500, m)
+	return 11000 * math.Pow(250.0/11000, m)
 }
 
 func (v *Voice) Start() {
@@ -307,6 +379,9 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 	frame := make([]int16, voiceFrame)
 	pkt := make([]byte, 3+voiceFrame)
 	noise := 200.0 // running noise-floor estimate (RMS)
+	// the last couple of quiet frames, sent when the gate opens so word starts aren't clipped
+	var pre [][]int16
+	wasTalking := false
 	for {
 		select {
 		case <-stop:
@@ -347,19 +422,32 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 		talking := time.Since(v.lastLoud) < 350*time.Millisecond && !v.Muted.Load()
 		v.talking.Store(talking)
 		if !talking {
+			wasTalking = false
+			pre = append(pre, append([]int16(nil), frame...))
+			if len(pre) > 2 {
+				pre = pre[1:]
+			}
 			continue
 		}
 		send := v.sender()
 		if send == nil {
 			continue
 		}
-		pkt[0] = vkAudio
-		binary.BigEndian.PutUint16(pkt[1:], v.seq)
-		v.seq++
-		for i, s := range frame {
-			pkt[3+i] = linearToULaw(s)
+		out := [][]int16{frame}
+		if !wasTalking {
+			out = append(pre, frame)
+			pre = nil
 		}
-		send(pkt)
+		wasTalking = true
+		for _, fr := range out {
+			pkt[0] = vkAudio24
+			binary.BigEndian.PutUint16(pkt[1:], v.seq)
+			v.seq++
+			for i, s := range fr {
+				pkt[3+i] = linearToULaw(s)
+			}
+			send(pkt)
+		}
 	}
 }
 
@@ -380,16 +468,34 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 		return
 	}
 	switch b[0] {
-	case vkAudio:
-		if len(b) != 3+voiceFrame {
+	case vkAudio, vkAudio24:
+		var fr []int16
+		switch {
+		case b[0] == vkAudio24 && len(b) == 3+voiceFrame:
+			fr = make([]int16, voiceFrame)
+			for i := range fr {
+				fr[i] = uLawToLinear(b[3+i])
+			}
+		case b[0] == vkAudio && len(b) == 3+legacyFrame: // older RingLink: 16 kHz, upsample x1.5
+			src := make([]float64, legacyFrame+1)
+			for i := 0; i < legacyFrame; i++ {
+				src[i] = float64(uLawToLinear(b[3+i]))
+			}
+			src[legacyFrame] = src[legacyFrame-1]
+			fr = make([]int16, voiceFrame)
+			for i := range fr {
+				t := float64(i) * legacyFrame / voiceFrame
+				k := int(t)
+				fr[i] = int16(src[k] + (src[k+1]-src[k])*(t-float64(k)))
+			}
+		default:
 			return
 		}
-		fr := make([]int16, voiceFrame)
 		loud := false
-		for i := range fr {
-			fr[i] = uLawToLinear(b[3+i])
-			if fr[i] > 2000 || fr[i] < -2000 {
+		for _, x := range fr {
+			if x > 2000 || x < -2000 {
 				loud = true
+				break
 			}
 		}
 		v.mu.Lock()
@@ -426,12 +532,14 @@ type mixJob struct {
 	p          *vpeer
 	fr         []int16
 	gain, muff float64
+	pan        float64
 }
 
 func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 	defer spk.Close()
-	out := make([]int16, voiceFrame)
-	mix := make([]float64, voiceFrame)
+	out := make([]int16, voiceFrame*spkChannels)
+	mixL := make([]float64, voiceFrame)
+	mixR := make([]float64, voiceFrame)
 	var jobs []mixJob
 	for {
 		select {
@@ -453,11 +561,14 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 				p.priming = true // ran dry: rebuffer before their next sentence
 			}
 			d := v.distLocked(p)
-			jobs = append(jobs, mixJob{p, fr, v.gainFor(d), v.muffleFor(d)})
+			pan, behind := v.dirLocked(p)
+			m := v.muffleFor(d)
+			m = 1 - (1-m)*(1-0.3*behind) // voices from behind you are a bit duller
+			jobs = append(jobs, mixJob{p, fr, v.gainFor(d), m, pan})
 		}
 		v.mu.Unlock()
-		for i := range mix {
-			mix[i] = 0
+		for i := range mixL {
+			mixL[i], mixR[i] = 0, 0
 		}
 		for _, j := range jobs {
 			p := j.p
@@ -467,10 +578,12 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 				p.lpA = a
 			}
 			if j.fr == nil { // silent this frame: keep filter/gain state moving
-				p.gain, p.lpA = j.gain, a
+				p.gain, p.lpA, p.pan = j.gain, a, j.pan
 				p.lp1, p.lp2 = 0, 0
 				continue
 			}
+			dp := (j.pan - p.pan) / voiceFrame
+			pn := p.pan
 			da := (a - p.lpA) / voiceFrame
 			step := (j.gain - p.gain) / voiceFrame // ramp so volume changes don't click
 			g, la := p.gain, p.lpA
@@ -483,16 +596,23 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 				if j.muff > 0.01 || la < 0.94 {
 					x = p.lp2
 				}
-				mix[i] += x * g * (1 + 0.5*j.muff) // muffled voices sound quieter; make up some loudness
+				x *= g * (1 + 0.5*j.muff) // muffled voices sound quieter; make up some loudness
+				// equal-power pan, 1:1 in the middle
+				pn += dp
+				th := (pn + 1) * math.Pi / 4
+				mixL[i] += x * math.Min(math.Cos(th)*math.Sqrt2, 1.25)
+				mixR[i] += x * math.Min(math.Sin(th)*math.Sqrt2, 1.25)
 			}
-			p.gain, p.lpA = j.gain, a
+			p.gain, p.lpA, p.pan = j.gain, a, j.pan
 		}
-		for i, x := range mix {
-			// gentle limiter so several people talking at once don't distort harshly
-			if ax := math.Abs(x); ax > 24000 {
-				x = math.Copysign(24000+(ax-24000)*0.25, x)
+		for i := range mixL {
+			for c, x := range [2]float64{mixL[i], mixR[i]} {
+				// gentle limiter so several people talking at once don't distort harshly
+				if ax := math.Abs(x); ax > 24000 {
+					x = math.Copysign(24000+(ax-24000)*0.25, x)
+				}
+				out[2*i+c] = int16(math.Max(-32768, math.Min(32767, x)))
 			}
-			out[i] = int16(math.Max(-32768, math.Min(32767, x)))
 		}
 		if err := spk.Write(out); err != nil {
 			select {
@@ -554,6 +674,7 @@ func (v *Voice) posLoop(stop chan struct{}) {
 			}
 		}
 		v.mu.Lock()
+		v.trackHeadingLocked(pos, game, v.myGame)
 		v.myPos, v.myGame = pos, game
 		v.mu.Unlock()
 		if send := v.sender(); send != nil {

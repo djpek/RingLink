@@ -45,7 +45,7 @@ func (a *animator) to(gtx layout.Context, key any, target, rate float32) float32
 	}
 	t.v += (target - t.v) * (1 - float32(math.Exp(float64(-dt*rate))))
 	if d := target - t.v; d > 0.002 || d < -0.002 {
-		gtx.Execute(op.InvalidateCmd{})
+		redrawIn(gtx, 30)
 	} else {
 		t.v = target
 	}
@@ -59,7 +59,7 @@ func (a *animator) intro(gtx layout.Context, delay, dur float64) float32 {
 	}
 	p := (gtx.Now.Sub(a.start).Seconds() - delay) / dur
 	if p < 1 {
-		gtx.Execute(op.InvalidateCmd{})
+		redrawIn(gtx, 30)
 	}
 	if p <= 0 {
 		return 0
@@ -72,7 +72,7 @@ func (a *animator) intro(gtx layout.Context, delay, dur float64) float32 {
 
 // pulse is a 0..1 wave (for breathing dots and talking rings); keeps frames coming.
 func pulse(gtx layout.Context, hz float64) float32 {
-	gtx.Execute(op.InvalidateCmd{})
+	redrawIn(gtx, 15) // ambient motion: 15 fps is plenty and keeps the GPU free for the game
 	s := float64(gtx.Now.UnixNano()) / 1e9
 	return float32(0.5 + 0.5*math.Sin(s*hz*2*math.Pi))
 }
@@ -134,7 +134,7 @@ func (a *animator) bounce(gtx layout.Context, key any, target float32) float32 {
 	if d := s.x - target; d < 0.0005 && d > -0.0005 && s.v < 0.002 && s.v > -0.002 {
 		s.x, s.v = target, 0
 	} else {
-		gtx.Execute(op.InvalidateCmd{})
+		redrawIn(gtx, 30)
 	}
 	return s.x
 }
@@ -143,4 +143,10 @@ func (a *animator) bounce(gtx layout.Context, key any, target float32) float32 {
 func scaleAbout(size image.Point, s float32) f32.Affine2D {
 	c := f32.Pt(float32(size.X)/2, float32(size.Y)/2)
 	return f32.Affine2D{}.Scale(c, f32.Pt(s, s))
+}
+
+// redrawIn asks for the next frame at most fps times a second. Requesting a frame
+// immediately (every vsync, often 144 Hz) made RingLink eat GPU time next to the game.
+func redrawIn(gtx layout.Context, fps int) {
+	gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(time.Second / time.Duration(fps))})
 }
