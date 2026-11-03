@@ -23,13 +23,28 @@ type procAudio struct {
 	cmd  *exec.Cmd
 	r    io.ReadCloser
 	w    io.WriteCloser
+	rf   *os.File // our end of the pipe (for backlog checks / pipe sizing)
 	buf  []byte
 	done chan struct{}
+
+	// playback pacing: never let more than playAhead of audio queue up in the pipe and
+	// the player, otherwise the pipe (64 KB = 2 s by default) fills and every voice lags behind
+	start   time.Time
+	written int64 // samples written since start
 }
+
+const playAhead = 80 * time.Millisecond
 
 func (p *procAudio) Read(frame []int16) error {
 	if len(p.buf) != len(frame)*2 {
 		p.buf = make([]byte, len(frame)*2)
+	}
+	// drop mic audio that piled up (e.g. after a stall) so we always send the newest sound
+	if p.rf != nil {
+		if n := pipeBacklog(p.rf); n > 3*len(p.buf) {
+			drop := (n - len(p.buf)) / len(p.buf) * len(p.buf)
+			io.CopyN(io.Discard, p.r, int64(drop))
+		}
 	}
 	if _, err := io.ReadFull(p.r, p.buf); err != nil {
 		return err
@@ -47,6 +62,18 @@ func (p *procAudio) Write(frame []int16) error {
 	for i, s := range frame {
 		binary.LittleEndian.PutUint16(p.buf[2*i:], uint16(s))
 	}
+	now := time.Now()
+	if p.start.IsZero() {
+		p.start = now
+	}
+	ahead := time.Duration(p.written)*time.Second/voiceRate - now.Sub(p.start)
+	if ahead < -200*time.Millisecond { // we fell behind (stall): restart the clock instead of bursting
+		p.start, p.written, ahead = now, 0, 0
+	}
+	if ahead > playAhead {
+		time.Sleep(ahead - playAhead)
+	}
+	p.written += int64(len(frame))
 	_, err := p.w.Write(p.buf)
 	return err
 }
@@ -95,21 +122,26 @@ func startProc(cands [][]string, capture bool, device string) (*procAudio, strin
 		}
 		cmd := exec.Command(path, args...)
 		p := &procAudio{cmd: cmd}
-		if capture {
-			p.r, err = cmd.StdoutPipe()
-		} else {
-			p.w, err = cmd.StdinPipe()
-		}
+		pr, pw, err := os.Pipe()
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		shrinkPipe(pw) // small pipe = little audio can hide in it
+		var other *os.File
+		if capture {
+			cmd.Stdout, p.r, p.rf, other = pw, pr, pr, pw
+		} else {
+			cmd.Stdin, p.w, other = pr, pw, pr
+		}
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Start(); err != nil {
+			pr.Close(); pw.Close()
 			lastErr = err
 			continue
 		}
+		other.Close() // the child has its own copy now
 		// make sure the tool actually works (it exits at once when there's no sound server)
 		done := make(chan struct{})
 		go func() { cmd.Wait(); close(done) }()
