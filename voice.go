@@ -98,7 +98,8 @@ const soundSpeed = 343.0
 // nextFrameLocked returns the next 20 ms of this peer's voice, played at rate r
 // (r > 1 = higher pitch, consumes audio a little faster), or nil when they're silent.
 func (p *vpeer) nextFrameLocked(r float64) []int16 {
-	if p.priming && len(p.queue) >= jitterTarget {
+	// at fast replay speeds each output frame eats several input frames, so buffer more
+	if p.priming && len(p.queue) >= jitterTarget+int(r)-1 {
 		p.priming = false
 	}
 	if p.priming {
@@ -121,7 +122,7 @@ func (p *vpeer) nextFrameLocked(r float64) []int16 {
 		p.queue = p.queue[1:]
 	}
 	if len(p.rs) < need {
-		p.priming, p.rs, p.ph = true, p.rs[:0], 0
+		p.priming = true // keep what's buffered: it continues once more arrives
 		return nil
 	}
 	out := make([]int16, voiceFrame)
@@ -221,6 +222,7 @@ type Voice struct {
 
 func NewVoice(logf func(string, ...any), notify func()) *Voice {
 	v := &Voice{logf: logf, notify: notify, peers: map[uint64]*vpeer{}, Replay: NewReplayVoice(), posKick: make(chan struct{}, 1)}
+	v.Replay.Run(make(chan struct{})) // session clock + replay position, for as long as the app runs
 	v.Sens.Store(60)
 	v.VolPct.Store(100)
 	v.RangeM.Store(150)
@@ -482,7 +484,6 @@ func (v *Voice) Start() {
 	go v.captureLoop(mic, stop)
 	go v.playLoop(spk, stop)
 	go v.posLoop(stop)
-	v.Replay.Run(stop)
 	v.notify()
 }
 
@@ -651,19 +652,22 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 		if loud {
 			p.talkAt = time.Now()
 		}
-		if v.running {
-			p.queue = append(p.queue, fr)
-			if v.Replay.Enabled() {
-				ul := make([]byte, voiceFrame)
-				for i, x := range fr {
-					ul[i] = linearToULaw(x)
-				}
-				var pp *vec3
-				if p.pos != nil && p.game == gameLMU && time.Since(p.posSeen) < 3*time.Second {
+		// saved for replays whether or not you can hear it right now (voice off, too far away)
+		if v.Replay.Enabled() {
+			ul := make([]byte, voiceFrame)
+			for i, x := range fr {
+				ul[i] = linearToULaw(x)
+			}
+			var pp *vec3
+			if p.pos != nil && p.game == gameLMU && time.Since(p.posSeen) < 3*time.Second {
+				if pp = p.mt.now(time.Now()); pp == nil {
 					pp = p.pos
 				}
-				v.Replay.Record(from, ul, pp)
 			}
+			v.Replay.Record(from, ul, pp)
+		}
+		if v.running {
+			p.queue = append(p.queue, fr)
 			if len(p.queue) > jitterMax {
 				p.queue = p.queue[len(p.queue)-jitterTarget:]
 			}
@@ -725,6 +729,8 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 		if v.rpPeers == nil {
 			v.rpPeers = map[uint64]*vpeer{}
 		}
+		rpSpeed := v.Replay.Speed()
+		rpMax := int(float64(jitterMax) * math.Max(1, rpSpeed))
 		for _, f := range v.Replay.Frames(now) {
 			q := v.rpPeers[f.Speaker]
 			if q == nil {
@@ -732,15 +738,16 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 				v.rpPeers[f.Speaker] = q
 			}
 			q.queue = append(q.queue, f.PCM)
-			if len(q.queue) > jitterMax {
-				q.queue = q.queue[len(q.queue)-jitterTarget:]
+			if len(q.queue) > rpMax {
+				q.queue = q.queue[len(q.queue)-rpMax/2:]
 			}
 			q.pos = f.Pos
 		}
 		if len(v.rpPeers) > 0 {
 			lp, lh, lok := v.Replay.Listener()
 			for _, q := range v.rpPeers {
-				fr := q.nextFrameLocked(1)
+				// slow motion stretches the voice (lower), fast forward squeezes it (higher)
+				fr := q.nextFrameLocked(rpSpeed)
 				if fr == nil {
 					continue
 				}

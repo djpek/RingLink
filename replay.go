@@ -317,7 +317,32 @@ func (r *ReplayVoice) replayTimeLocked(now time.Time) (et float64, normal, activ
 		return 0, false, false
 	}
 	sp := r.rpSpeed
-	return r.rpET + sp*now.Sub(r.rpAt).Seconds(), sp > 0.85 && sp < 1.2, true
+	return r.rpET + sp*now.Sub(r.rpAt).Seconds(), sp >= minReplaySpeed && sp <= maxReplaySpeed, true
+}
+
+// voice plays along with slow motion and fast forward (pitch follows, like a tape);
+// paused, rewinding or very fast skipping stays quiet
+const (
+	minReplaySpeed = 0.2
+	maxReplaySpeed = 4.0
+)
+
+// Speed: how fast the replay is playing (1 = normal), for the mixer's resampler.
+func (r *ReplayVoice) Speed() float64 {
+	if r == nil {
+		return 1
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sp := r.rpSpeed
+	if sp < minReplaySpeed || sp > maxReplaySpeed {
+		return 1
+	}
+	// snap near-normal speed to exactly 1 so normal replays aren't resampled
+	if math.Abs(sp-1) < 0.04 {
+		return 1
+	}
+	return sp
 }
 
 // Frames returns the recorded frames to play during the next 20 ms of the replay.
@@ -339,7 +364,7 @@ func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 	}
 	t0 := r.lastT
 	r.lastT = t
-	if !normal || t < t0 || t-t0 > 0.5 { // paused, fast-forward/rewind or a jump: stay quiet and re-aim
+	if !normal || t < t0 || t-t0 > 0.5*math.Max(1, r.rpSpeed) { // paused, rewind or a jump: stay quiet and re-aim
 		r.cursor = sort.Search(len(r.frames), func(i int) bool { return r.frames[i].et >= t })
 		r.playingNow = false
 		return nil
@@ -352,7 +377,7 @@ func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 	var out []ReplayVoiceFrame
 	for ; r.cursor < len(r.frames) && r.frames[r.cursor].et < t; r.cursor++ {
 		f := r.frames[r.cursor]
-		if f.et < t-0.5 {
+		if f.et < t-0.5*math.Max(1, r.rpSpeed) {
 			continue // stale (just loaded or caught up after a hiccup)
 		}
 		fr := make([]int16, voiceFrame)

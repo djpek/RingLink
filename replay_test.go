@@ -120,3 +120,38 @@ func TestReplayPicksTheRightSession(t *testing.T) {
 		t.Fatalf("practice replay loaded %q", r.loaded)
 	}
 }
+
+// Slow motion and fast forward: the voice keeps playing, stretched or squeezed in step
+// with the replay, with no gaps once it's going.
+func TestReplayVoiceAtOtherSpeeds(t *testing.T) {
+	for _, sp := range []float64{0.25, 0.5, 2, 4} {
+		q := &vpeer{priming: true}
+		ph := 0.0
+		in := func() {
+			fr := make([]int16, voiceFrame)
+			for k := range fr {
+				fr[k] = int16(8000 * math.Sin(ph))
+				ph += 2 * math.Pi * 200 / voiceRate
+			}
+			q.queue = append(q.queue, fr)
+		}
+		// the replay hands out sp frames' worth of recorded audio per 20 ms
+		acc, got, gaps := 0.0, 0, 0
+		for tick := 0; tick < 300; tick++ {
+			for acc += sp; acc >= 1; acc-- {
+				in()
+			}
+			fr := q.nextFrameLocked(sp)
+			if fr == nil {
+				if got > 0 {
+					gaps++
+				}
+				continue
+			}
+			got++
+		}
+		if got < 250 || gaps > 0 {
+			t.Errorf("speed %.2f: %d frames played, %d gaps", sp, got, gaps)
+		}
+	}
+}
