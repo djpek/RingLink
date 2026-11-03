@@ -137,7 +137,8 @@ func startProc(cands [][]string, capture bool, device string) (*procAudio, strin
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Start(); err != nil {
-			pr.Close(); pw.Close()
+			pr.Close()
+			pw.Close()
 			lastErr = err
 			continue
 		}

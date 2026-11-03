@@ -123,6 +123,7 @@ type ui struct {
 	minusBtn, plusBtn, logBtn  widget.Clickable
 	gameBtns                   [3]widget.Clickable
 	sens, vol, rng, muff       widget.Float
+	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
 	copiedAt                   time.Time
 	showLog                    bool
@@ -1167,7 +1168,7 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 						layout.Rigid(u.label(13.5, "Mic level", colText)),
 						layout.Rigid(layout.Spacer{Width: 12}.Layout),
-						layout.Flexed(1, u.barK(&u.sens, float32(vs.Level)/100, lvlC, 0)),
+						layout.Flexed(1, u.barK(&u.micLevelKey, float32(vs.Level)/100, lvlC, 0)),
 						layout.Rigid(layout.Spacer{Width: 12}.Layout),
 						layout.Rigid(u.label(12.5, status, lvlC)),
 					)
