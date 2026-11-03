@@ -70,3 +70,5 @@ func (w *winInput) pressed() map[string]bool {
 func bindCaption() string {
 	return "Hold it and everyone hears you at full volume, wherever they are on track. Works with any key or a button on your wheel / button box, even while the game is focused."
 }
+
+func x11KeyName(int) string { return "" }

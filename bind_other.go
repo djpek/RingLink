@@ -3,7 +3,7 @@
 package main
 
 // Linux: wheel / joystick buttons through the joystick devices (/dev/input/js*), which
-// normal users can read. Global keyboard keys would need root, so they aren't offered.
+// normal users can read, plus keyboard keys from the X server (bind_x11.go).
 
 import (
 	"encoding/binary"
@@ -51,7 +51,8 @@ func (j *jsInput) pressed() map[string]bool {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	out := make(map[string]bool, len(j.down))
+	out := make(map[string]bool, len(j.down)+2)
+	x11Keys(out)
 	for k, v := range j.down {
 		if v {
 			out[k] = true
@@ -87,5 +88,8 @@ func (j *jsInput) read(path string, n int, f *os.File) {
 }
 
 func bindCaption() string {
-	return "Hold it and everyone hears you at full volume, wherever they are on track. Use a button on your wheel / button box (keyboard keys can't be read while the game is focused on Linux)."
+	if haveKeyboard {
+		return "Hold it and everyone hears you at full volume, wherever they are on track. Works with a keyboard key or a button on your wheel / button box, even while the game is focused."
+	}
+	return "Hold it and everyone hears you at full volume, wherever they are on track. Use a button on your wheel / button box."
 }

@@ -108,6 +108,14 @@ func bindName(id string) string {
 		if n, _ := sscan2(id, "joy%d:b%d", &dev, &btn); n == 2 {
 			return "Controller " + itoa(dev+1) + " button " + itoa(btn+1)
 		}
+	case strings.HasPrefix(id, "xkey:"):
+		var kc int
+		if n, _ := sscan1(id, "xkey:%d", &kc); n == 1 {
+			if nm := x11KeyName(kc); nm != "" {
+				return xName(nm)
+			}
+			return "Key " + itoa(kc)
+		}
 	case strings.HasPrefix(id, "key:"):
 		var vk int
 		if n, _ := sscan1(id, "key:%d", &vk); n == 1 {
@@ -136,4 +144,39 @@ func keyName(vk int) string {
 		return s
 	}
 	return "Key " + itoa(vk)
+}
+
+// xName tidies X keysym names: "a" -> "Key A", "Control_L" -> "Left Ctrl", "KP_1" -> "Numpad 1".
+func xName(n string) string {
+	if len(n) == 1 {
+		return "Key " + strings.ToUpper(n)
+	}
+	side := ""
+	if strings.HasSuffix(n, "_L") {
+		side, n = "Left ", n[:len(n)-2]
+	} else if strings.HasSuffix(n, "_R") {
+		side, n = "Right ", n[:len(n)-2]
+	}
+	switch n {
+	case "Control":
+		n = "Ctrl"
+	case "Super":
+		n = "Windows key"
+	case "Prior":
+		n = "Page Up"
+	case "Next":
+		n = "Page Down"
+	case "Return":
+		n = "Enter"
+	case "Escape":
+		n = "Esc"
+	case "grave":
+		n = "` key"
+	case "space":
+		n = "Space"
+	}
+	if strings.HasPrefix(n, "KP_") {
+		n = "Numpad " + n[3:]
+	}
+	return side + n
 }
