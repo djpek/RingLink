@@ -26,14 +26,22 @@ import (
 )
 
 const (
-	recFrameBytes  = 8 + 8 + voiceFrame // ET (float64), speaker id, mu-law samples
+	recFrameBytes  = 8 + 8 + 12 + voiceFrame // ET (float64), speaker id, car position (3x float32, NaN = none), mu-law
 	maxReplayFiles = 30
 )
 
 type recFrame struct {
 	et      float64
 	speaker uint64
+	pos     *vec3 // where their car was (nil: garage / unknown -> heard at full volume)
 	data    []byte
+}
+
+// ReplayVoiceFrame is one recorded frame to play now, with where it came from.
+type ReplayVoiceFrame struct {
+	Speaker uint64
+	Pos     *vec3
+	PCM     []int16
 }
 
 type ReplayVoice struct {
@@ -59,6 +67,40 @@ type ReplayVoice struct {
 	lastT      float64
 	playingNow bool
 	loadTry    time.Time
+	// the car the replay camera is following (the listener while watching)
+	lisPos  *vec3
+	lisHead [2]float64
+	lisOK   bool
+}
+
+// InReplay: LMU says you're not live (watching a replay).
+func (r *ReplayVoice) InReplay() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.realtime && !r.etAt.IsZero() && time.Since(r.etAt) < 2*time.Second
+}
+
+// SetListener records where the replay camera's car is and which way it's heading.
+func (r *ReplayVoice) SetListener(pos, vel *vec3, inReplay bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !inReplay || pos == nil {
+		r.lisPos, r.lisOK = nil, false
+		return
+	}
+	if vel != nil {
+		if n := math.Hypot(vel.X, vel.Z); n > 1.5 {
+			r.lisHead, r.lisOK = [2]float64{vel.X / n, vel.Z / n}, true
+		}
+	}
+	r.lisPos = pos
+}
+
+// Listener: the replay camera car's position and heading (ok=false if unknown).
+func (r *ReplayVoice) Listener() (pos *vec3, head [2]float64, headOK bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lisPos, r.lisHead, r.lisOK
 }
 
 func (r *ReplayVoice) Enabled() bool      { return r != nil && !r.off.Load() }
@@ -169,7 +211,7 @@ func (r *ReplayVoice) liveETLocked(now time.Time) (float64, bool) {
 }
 
 // Record stores one 20 ms voice frame (mu-law) heard or spoken live.
-func (r *ReplayVoice) Record(speaker uint64, ulaw []byte) {
+func (r *ReplayVoice) Record(speaker uint64, ulaw []byte, pos *vec3) {
 	if r == nil || !r.Enabled() || len(ulaw) != voiceFrame {
 		return
 	}
@@ -186,7 +228,7 @@ func (r *ReplayVoice) Record(speaker uint64, ulaw []byte) {
 	}
 	if r.rec == nil {
 		os.MkdirAll(r.dir, 0o755)
-		name := now.Format("2006-01-02_15-04-05") + "_" + safeName(r.track) + ".rlv"
+		name := now.Format("2006-01-02_15-04-05") + "_" + safeName(r.track) + ".rlv2"
 		f, err := os.Create(filepath.Join(r.dir, name))
 		if err != nil {
 			return
@@ -197,7 +239,14 @@ func (r *ReplayVoice) Record(speaker uint64, ulaw []byte) {
 	b := make([]byte, recFrameBytes)
 	binary.LittleEndian.PutUint64(b, math.Float64bits(et))
 	binary.LittleEndian.PutUint64(b[8:], speaker)
-	copy(b[16:], ulaw)
+	px, py, pz := float32(math.NaN()), float32(0), float32(0)
+	if pos != nil {
+		px, py, pz = float32(pos.X), float32(pos.Y), float32(pos.Z)
+	}
+	binary.LittleEndian.PutUint32(b[16:], math.Float32bits(px))
+	binary.LittleEndian.PutUint32(b[20:], math.Float32bits(py))
+	binary.LittleEndian.PutUint32(b[24:], math.Float32bits(pz))
+	copy(b[28:], ulaw)
 	r.rec.Write(b)
 	r.recLast = et
 }
@@ -210,7 +259,7 @@ func (r *ReplayVoice) closeRecLocked() {
 }
 
 func (r *ReplayVoice) pruneLocked() {
-	m, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv"))
+	m, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv2"))
 	sort.Strings(m)
 	for len(m) > maxReplayFiles {
 		os.Remove(m[0])
@@ -246,7 +295,7 @@ func (r *ReplayVoice) replayTimeLocked(now time.Time) (et float64, normal, activ
 
 // Frames returns the recorded frames to play during the next 20 ms of the replay.
 // Called from the mixer every frame.
-func (r *ReplayVoice) Frames(now time.Time) [][]int16 {
+func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 	if r == nil || !r.Enabled() {
 		return nil
 	}
@@ -268,7 +317,7 @@ func (r *ReplayVoice) Frames(now time.Time) [][]int16 {
 		return nil
 	}
 	i := sort.Search(len(r.frames), func(i int) bool { return r.frames[i].et >= t0 })
-	var out [][]int16
+	var out []ReplayVoiceFrame
 	seen := map[uint64]bool{}
 	for ; i < len(r.frames) && r.frames[i].et < t; i++ {
 		f := r.frames[i]
@@ -280,7 +329,7 @@ func (r *ReplayVoice) Frames(now time.Time) [][]int16 {
 		for k := range fr {
 			fr[k] = uLawToLinear(f.data[k])
 		}
-		out = append(out, fr)
+		out = append(out, ReplayVoiceFrame{f.speaker, f.pos, fr})
 	}
 	r.playingNow = len(out) > 0
 	return out
@@ -297,7 +346,7 @@ func (r *ReplayVoice) ensureLoadedLocked(t float64) bool {
 		return false
 	}
 	r.loadTry = time.Now()
-	m, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv"))
+	m, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv2"))
 	sort.Sort(sort.Reverse(sort.StringSlice(m)))
 	for _, p := range m {
 		fr := readRecording(p)
@@ -316,11 +365,17 @@ func readRecording(p string) []recFrame {
 	}
 	var out []recFrame
 	for off := 0; off+recFrameBytes <= len(b); off += recFrameBytes {
-		out = append(out, recFrame{
+		f := recFrame{
 			et:      math.Float64frombits(binary.LittleEndian.Uint64(b[off:])),
 			speaker: binary.LittleEndian.Uint64(b[off+8:]),
-			data:    b[off+16 : off+recFrameBytes],
-		})
+			data:    b[off+28 : off+recFrameBytes],
+		}
+		x := math.Float32frombits(binary.LittleEndian.Uint32(b[off+16:]))
+		if !math.IsNaN(float64(x)) {
+			f.pos = &vec3{float64(x), float64(math.Float32frombits(binary.LittleEndian.Uint32(b[off+20:]))),
+				float64(math.Float32frombits(binary.LittleEndian.Uint32(b[off+24:])))}
+		}
+		out = append(out, f)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].et < out[j].et })
 	return out

@@ -21,7 +21,7 @@ func TestReplayVoiceRoundTrip(t *testing.T) {
 		r.mu.Lock()
 		r.etAt = start.Add(-time.Duration(i) * 20 * time.Millisecond) // clock advances 20 ms per frame
 		r.mu.Unlock()
-		r.Record(7, ul)
+		r.Record(7, ul, &vec3{1, 2, 3})
 	}
 	r.mu.Lock()
 	r.closeRecLocked()
@@ -39,7 +39,7 @@ func TestReplayVoiceRoundTrip(t *testing.T) {
 		r.rpET = 100.22 + float64(k)*0.02
 		r.mu.Unlock()
 		for _, f := range r.Frames(at) {
-			if f[10] > 4000 {
+			if f.PCM[10] > 4000 && f.Pos != nil && f.Pos.Y == 2 {
 				got++
 			}
 		}

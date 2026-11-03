@@ -182,19 +182,21 @@ type Voice struct {
 	logf   func(string, ...any)
 	notify func()
 
-	mu       sync.Mutex
-	running  bool
-	stop     chan struct{}
-	peers    map[uint64]*vpeer
-	myPos    *vec3
-	myGame   byte
-	myHead   [2]float64 // unit heading in the horizontal plane (from how the car moves)
-	haveHead bool
-	headAt   [2]float64 // position the heading was last measured from
-	micDev   string
-	spkDev   string
-	backend  string
-	errText  string
+	mu        sync.Mutex
+	running   bool
+	stop      chan struct{}
+	peers     map[uint64]*vpeer
+	rpPeers   map[uint64]*vpeer // filter/pan state for replayed voices (playback goroutine)
+	broadcast bool              // in the garage / watching a replay: you're heard at full volume, centred
+	myPos     *vec3
+	myGame    byte
+	myHead    [2]float64 // unit heading in the horizontal plane (from how the car moves)
+	haveHead  bool
+	headAt    [2]float64 // position the heading was last measured from
+	micDev    string
+	spkDev    string
+	backend   string
+	errText   string
 
 	GameMode atomic.Int32 // gameNone = auto, gameLMU, gameBeamNG
 	Muted    atomic.Bool
@@ -350,20 +352,28 @@ func horiz(p *vec3, game byte) [2]float64 {
 // dirLocked: where a peer is relative to your car. pan is -1 (left) .. +1 (right),
 // behind is 0 (in front or beside) .. 1 (straight behind). Zero when unknown.
 func (v *Voice) dirLocked(p *vpeer) (pan, behind float64) {
-	if !v.Direct.Load() || !v.haveHead || v.myPos == nil || p.pos == nil || p.game != v.myGame || time.Since(p.posSeen) > 3*time.Second {
+	if !v.haveHead || v.myPos == nil || p.pos == nil || p.game != v.myGame || time.Since(p.posSeen) > 3*time.Second {
 		return 0, 0
 	}
-	a, b := horiz(v.myPos, v.myGame), horiz(p.pos, p.game)
+	return v.dirFrom(v.myPos, v.myHead, v.myGame, p.pos)
+}
+
+// dirFrom: where src is relative to a listener at pos heading head.
+// pan is -1 (left) .. +1 (right), behind is 0 (in front or beside) .. 1 (straight behind).
+func (v *Voice) dirFrom(pos *vec3, head [2]float64, game byte, src *vec3) (pan, behind float64) {
+	if !v.Direct.Load() || pos == nil || src == nil {
+		return 0, 0
+	}
+	a, b := horiz(pos, game), horiz(src, game)
 	dx, dz := b[0]-a[0], b[1]-a[1]
 	l := math.Hypot(dx, dz)
 	if l < 1 {
 		return 0, 0
 	}
 	dx, dz = dx/l, dz/l
-	f := v.myHead
 	// both games: facing +forward, right-hand side is (f.z, -f.x)
-	pan = dx*f[1] - dz*f[0]
-	if fw := dx*f[0] + dz*f[1]; fw < 0 {
+	pan = dx*head[1] - dz*head[0]
+	if fw := dx*head[0] + dz*head[1]; fw < 0 {
 		behind = -fw
 	}
 	return pan, behind
@@ -544,7 +554,12 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 				pkt[3+i] = linearToULaw(s)
 			}
 			send(pkt)
-			v.Replay.Record(0, pkt[3:])
+			if v.Replay.Enabled() {
+				v.mu.Lock()
+				mp := v.myPos
+				v.mu.Unlock()
+				v.Replay.Record(0, pkt[3:], mp)
+			}
 		}
 	}
 }
@@ -608,7 +623,11 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 				for i, x := range fr {
 					ul[i] = linearToULaw(x)
 				}
-				v.Replay.Record(from, ul)
+				var pp *vec3
+				if p.pos != nil && p.game == gameLMU && time.Since(p.posSeen) < 3*time.Second {
+					pp = p.pos
+				}
+				v.Replay.Record(from, ul, pp)
 			}
 			if len(p.queue) > jitterMax {
 				p.queue = p.queue[len(p.queue)-jitterTarget:]
@@ -664,6 +683,32 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 			m = 1 - (1-m)*(1-0.3*behind) // voices from behind you are a bit duller
 			jobs = append(jobs, mixJob{p, fr, v.gainFor(d), m, pan})
 		}
+		// voices recorded at this moment of the replay you're watching, coming from where
+		// each speaker's car was, heard from the car the replay camera follows
+		if rf := v.Replay.Frames(now); len(rf) > 0 {
+			lp, lh, lok := v.Replay.Listener()
+			if v.rpPeers == nil {
+				v.rpPeers = map[uint64]*vpeer{}
+			}
+			for _, f := range rf {
+				q := v.rpPeers[f.Speaker]
+				if q == nil {
+					q = &vpeer{}
+					v.rpPeers[f.Speaker] = q
+				}
+				d := -1.0
+				if lp != nil && f.Pos != nil {
+					dx, dy, dz := lp.X-f.Pos.X, lp.Y-f.Pos.Y, lp.Z-f.Pos.Z
+					d = math.Sqrt(dx*dx + dy*dy + dz*dz)
+				}
+				pan, behind := 0.0, 0.0
+				if lok {
+					pan, behind = v.dirFrom(lp, lh, gameLMU, f.Pos)
+				}
+				m := 1 - (1-v.muffleFor(d))*(1-0.3*behind)
+				jobs = append(jobs, mixJob{q, f.PCM, v.gainFor(d), m, pan})
+			}
+		}
 		v.mu.Unlock()
 		for i := range mixL {
 			mixL[i], mixR[i] = 0, 0
@@ -703,16 +748,6 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 			}
 			p.gain, p.lpA, p.pan = j.gain, a, j.pan
 		}
-		// voices recorded during this moment of the replay you're watching (centred)
-		if rf := v.Replay.Frames(now); len(rf) > 0 {
-			g := float64(v.VolPct.Load()) / 100
-			for _, fr := range rf {
-				for i, x := range fr {
-					mixL[i] += float64(x) * g
-					mixR[i] += float64(x) * g
-				}
-			}
-		}
 		for i := range mixL {
 			for c, x := range [2]float64{mixL[i], mixR[i]} {
 				// gentle limiter so several people talking at once don't distort harshly
@@ -748,11 +783,22 @@ func (v *Voice) PeerIDs() []uint64 {
 
 // ---------- positions from LMU ----------
 
+type lmuVec struct{ X, Y, Z float64 }
+
 type lmuStanding struct {
-	Player      bool `json:"player"`
-	CarPosition *struct {
-		X, Y, Z float64
-	} `json:"carPosition"`
+	Player        bool    `json:"player"`
+	HasFocus      bool    `json:"hasFocus"`
+	InGarageStall bool    `json:"inGarageStall"`
+	CarPosition   *lmuVec `json:"carPosition"`
+	CarVelocity   *lmuVec `json:"carVelocity"`
+}
+
+// lmuState is what one look at LMU's standings tells us.
+type lmuState struct {
+	pos, vel       *vec3 // your car
+	inGarage       bool
+	focus, focusVl *vec3 // the car the camera follows (the replay's car while watching one)
+	ok             bool
 }
 
 func (v *Voice) posLoop(stop chan struct{}) {
@@ -769,7 +815,8 @@ func (v *Voice) posLoop(stop chan struct{}) {
 		// BeamNG only sends while you're driving, so a recent packet wins;
 		// otherwise ask LMU.
 		var game byte
-		var pos *vec3
+		var pos, vel *vec3
+		broadcast := false // in the garage or watching a replay: talk to everyone at full volume
 		mode := byte(v.GameMode.Load())
 		if mode != gameLMU {
 			if pos = bng.recent(time.Second); pos != nil {
@@ -777,17 +824,29 @@ func (v *Voice) posLoop(stop chan struct{}) {
 			}
 		}
 		if pos == nil && mode != gameBeamNG {
-			if pos = readLMUPos(cl); pos != nil {
-				game = gameLMU
+			if st := readLMU(cl); st.ok {
+				inReplay := v.Replay.InReplay()
+				v.Replay.SetListener(st.focus, st.focusVl, inReplay)
+				switch {
+				case inReplay || st.inGarage:
+					broadcast = true
+				case st.pos != nil:
+					pos, vel, game = st.pos, st.vel, gameLMU
+				}
 			}
 		}
 		v.mu.Lock()
-		v.trackHeadingLocked(pos, game, v.myGame)
-		v.myPos, v.myGame = pos, game
+		if vel != nil && game == gameLMU && math.Hypot(vel.X, vel.Z) > 1.5 {
+			n := math.Hypot(vel.X, vel.Z) // LMU tells us which way the car is going
+			v.myHead, v.haveHead, v.headAt = [2]float64{vel.X / n, vel.Z / n}, true, horiz(pos, game)
+		} else {
+			v.trackHeadingLocked(pos, game, v.myGame)
+		}
+		v.myPos, v.myGame, v.broadcast = pos, game, broadcast
 		v.mu.Unlock()
 		if send := v.sender(); send != nil {
 			if pos == nil {
-				send([]byte{vkPos})
+				send([]byte{vkPos}) // no position = everyone hears you at full volume
 			} else {
 				b := make([]byte, 26)
 				b[0], b[1] = vkPos, game
@@ -800,26 +859,33 @@ func (v *Voice) posLoop(stop chan struct{}) {
 	}
 }
 
-func readLMUPos(cl *http.Client) *vec3 {
+func readLMU(cl *http.Client) lmuState {
+	var out lmuState
 	r, err := cl.Get("http://127.0.0.1:6397/rest/watch/standings")
 	if err != nil {
-		return nil
+		return out
 	}
 	defer r.Body.Close()
 	var st []lmuStanding
 	if json.NewDecoder(r.Body).Decode(&st) != nil {
-		return nil
+		return out
+	}
+	out.ok = true
+	conv := func(p *lmuVec) *vec3 {
+		if p == nil || p.X == 0 && p.Y == 0 && p.Z == 0 {
+			return nil
+		}
+		return &vec3{p.X, p.Y, p.Z}
 	}
 	for _, s := range st {
-		if s.Player && s.CarPosition != nil {
-			p := s.CarPosition
-			if p.X == 0 && p.Y == 0 && p.Z == 0 {
-				return nil
-			}
-			return &vec3{p.X, p.Y, p.Z}
+		if s.Player {
+			out.pos, out.vel, out.inGarage = conv(s.CarPosition), conv(s.CarVelocity), s.InGarageStall
+		}
+		if s.HasFocus {
+			out.focus, out.focusVl = conv(s.CarPosition), conv(s.CarVelocity)
 		}
 	}
-	return nil
+	return out
 }
 
 // ---------- G.711 mu-law ----------
