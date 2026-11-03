@@ -34,7 +34,7 @@ type procAudio struct {
 	written int64 // samples written since start
 }
 
-const playAhead = 80 * time.Millisecond
+const playAhead = 120 * time.Millisecond // headroom so a busy CPU (the game) doesn't make it crackle
 
 func (p *procAudio) Read(frame []int16) error {
 	if len(p.buf) != len(frame)*2 {
@@ -104,8 +104,8 @@ var micCmds = [][]string{
 }
 
 var spkCmds = [][]string{
-	{"pacat", "--playback", "--raw", "--format=s16le", "--rate=" + rateS, "--channels=2", "--latency-msec=60", "--client-name=RingLink", "--stream-name=Voice chat"},
-	{"pw-play", "--rate", rateS, "--channels", "2", "--format", "s16", "--latency", "60ms", "-"},
+	{"pacat", "--playback", "--raw", "--format=s16le", "--rate=" + rateS, "--channels=2", "--latency-msec=80", "--client-name=RingLink", "--stream-name=Voice chat"},
+	{"pw-play", "--rate", rateS, "--channels", "2", "--format", "s16", "--latency", "80ms", "-"},
 	{"aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rateS, "-c", "2", "--buffer-time=80000"},
 }
 

@@ -208,6 +208,9 @@ type Voice struct {
 	Doppler  atomic.Int32 // 0..100: pitch shift from closing speed (100 = realistic)
 	Direct   atomic.Bool  // pan voices left/right by where their car is relative to yours
 	Replay   *ReplayVoice // voice in game replays
+	BcastBtn atomic.Bool  // "Broadcast" button switched on in the app
+	BcastKey atomic.Bool  // push-to-broadcast key / wheel button held
+	posKick  chan struct{}
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
 	seq      uint16
@@ -215,7 +218,7 @@ type Voice struct {
 }
 
 func NewVoice(logf func(string, ...any), notify func()) *Voice {
-	v := &Voice{logf: logf, notify: notify, peers: map[uint64]*vpeer{}, Replay: NewReplayVoice()}
+	v := &Voice{logf: logf, notify: notify, peers: map[uint64]*vpeer{}, Replay: NewReplayVoice(), posKick: make(chan struct{}, 1)}
 	v.Sens.Store(60)
 	v.VolPct.Store(100)
 	v.RangeM.Store(150)
@@ -223,6 +226,18 @@ func NewVoice(logf func(string, ...any), notify func()) *Voice {
 	v.Direct.Store(true)
 	v.Doppler.Store(50)
 	return v
+}
+
+// Broadcasting: everyone hears you at full volume, centred, wherever their car is.
+func (v *Voice) Broadcasting() bool { return v.BcastBtn.Load() || v.BcastKey.Load() }
+
+// KickPos sends your position (or "no position" while broadcasting) right away
+// instead of waiting for the next 200 ms tick, so the first words already count.
+func (v *Voice) KickPos() {
+	select {
+	case v.posKick <- struct{}{}:
+	default:
+	}
 }
 
 func (v *Voice) SetSender(f func([]byte)) {
@@ -683,30 +698,45 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 			m = 1 - (1-m)*(1-0.3*behind) // voices from behind you are a bit duller
 			jobs = append(jobs, mixJob{p, fr, v.gainFor(d), m, pan})
 		}
-		// voices recorded at this moment of the replay you're watching, coming from where
-		// each speaker's car was, heard from the car the replay camera follows
-		if rf := v.Replay.Frames(now); len(rf) > 0 {
-			lp, lh, lok := v.Replay.Listener()
-			if v.rpPeers == nil {
-				v.rpPeers = map[uint64]*vpeer{}
+		// voices recorded at this moment of the replay you're watching: queued per speaker
+		// (so they play back smoothly) and heard from where their car was, relative to
+		// the car the replay camera follows
+		if v.rpPeers == nil {
+			v.rpPeers = map[uint64]*vpeer{}
+		}
+		for _, f := range v.Replay.Frames(now) {
+			q := v.rpPeers[f.Speaker]
+			if q == nil {
+				q = &vpeer{priming: true}
+				v.rpPeers[f.Speaker] = q
 			}
-			for _, f := range rf {
-				q := v.rpPeers[f.Speaker]
-				if q == nil {
-					q = &vpeer{}
-					v.rpPeers[f.Speaker] = q
+			q.queue = append(q.queue, f.PCM)
+			if len(q.queue) > jitterMax {
+				q.queue = q.queue[len(q.queue)-jitterTarget:]
+			}
+			q.pos = f.Pos
+		}
+		if len(v.rpPeers) > 0 {
+			lp, lh, lok := v.Replay.Listener()
+			for _, q := range v.rpPeers {
+				fr := q.nextFrameLocked(1)
+				if fr == nil {
+					continue
 				}
 				d := -1.0
-				if lp != nil && f.Pos != nil {
-					dx, dy, dz := lp.X-f.Pos.X, lp.Y-f.Pos.Y, lp.Z-f.Pos.Z
+				if lp != nil && q.pos != nil {
+					dx, dy, dz := lp.X-q.pos.X, lp.Y-q.pos.Y, lp.Z-q.pos.Z
 					d = math.Sqrt(dx*dx + dy*dy + dz*dz)
 				}
 				pan, behind := 0.0, 0.0
 				if lok {
-					pan, behind = v.dirFrom(lp, lh, gameLMU, f.Pos)
+					pan, behind = v.dirFrom(lp, lh, gameLMU, q.pos)
 				}
 				m := 1 - (1-v.muffleFor(d))*(1-0.3*behind)
-				jobs = append(jobs, mixJob{q, f.PCM, v.gainFor(d), m, pan})
+				// replays: distance still fades and muffles, but never below 40 % so
+				// teammates far from the camera car stay audible
+				g := math.Max(v.gainFor(d), 0.4*float64(v.VolPct.Load())/100)
+				jobs = append(jobs, mixJob{q, fr, g, m, pan})
 			}
 		}
 		v.mu.Unlock()
@@ -811,6 +841,7 @@ func (v *Voice) posLoop(stop chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
+		case <-v.posKick:
 		}
 		// BeamNG only sends while you're driving, so a recent packet wins;
 		// otherwise ask LMU.
@@ -845,7 +876,7 @@ func (v *Voice) posLoop(stop chan struct{}) {
 		v.myPos, v.myGame, v.broadcast = pos, game, broadcast
 		v.mu.Unlock()
 		if send := v.sender(); send != nil {
-			if pos == nil {
+			if pos == nil || v.Broadcasting() {
 				send([]byte{vkPos}) // no position = everyone hears you at full volume
 			} else {
 				b := make([]byte, 26)

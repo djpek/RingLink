@@ -29,6 +29,7 @@ type Settings struct {
 	VoiceDir    *bool  `json:"voiceDirectional,omitempty"`
 	VoiceDop    *int   `json:"voiceDoppler,omitempty"`
 	ReplayVoice *bool  `json:"replayVoice,omitempty"`
+	BcastBind   string `json:"broadcastBind,omitempty"` // push-to-broadcast key / wheel button
 }
 
 type App struct {
@@ -38,6 +39,7 @@ type App struct {
 	logs   []string
 	notify func()
 	Voice  *Voice
+	Bind   *Binder
 	sig    func(topic string) Signaler // tests swap the relay
 }
 
@@ -69,6 +71,21 @@ func NewApp(notify func()) *App {
 	if a.S.ReplayVoice != nil {
 		a.Voice.Replay.SetEnabled(*a.S.ReplayVoice)
 	}
+	a.Bind = NewBinder()
+	a.Bind.SetBind(a.S.BcastBind)
+	a.Bind.onChange = func(held bool) {
+		a.Voice.BcastKey.Store(held)
+		a.Voice.KickPos()
+		a.poke()
+	}
+	a.Bind.onCapture = func(id string) {
+		a.mu.Lock()
+		a.S.BcastBind = id
+		a.mu.Unlock()
+		a.Save()
+		a.poke()
+	}
+	go a.Bind.Run(nil)
 	a.Voice.GameMode.Store(int32(a.S.Game))
 	a.Voice.SetDevices(a.S.MicDevice, a.S.SpkDevice)
 	if a.S.MaxPeople < 2 || a.S.MaxPeople > MaxRoomSize {

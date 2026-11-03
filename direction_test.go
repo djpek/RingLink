@@ -10,7 +10,7 @@ func TestDirectionalPan(t *testing.T) {
 	for _, g := range []struct {
 		game  byte
 		ahead func(float64) *vec3 // a point d metres "forward" along the game's horizontal forward axis
-		right *vec3                // a point to the right of a car driving that way
+		right *vec3               // a point to the right of a car driving that way
 	}{
 		// LMU: y up, left-handed; driving +z, +x is on your right
 		{gameLMU, func(d float64) *vec3 { return &vec3{0, 0, d} }, &vec3{10, 0, 3}},

@@ -55,3 +55,30 @@ func TestReplayVoiceRoundTrip(t *testing.T) {
 		t.Fatalf("paused replay still played %d frames", len(f))
 	}
 }
+
+// LMU's clock moves in 0.2 s steps; recorded frames must still come out evenly spaced.
+func TestReplayStampsEvenWithSteppedClock(t *testing.T) {
+	r := NewReplayVoice()
+	r.dir = t.TempDir()
+	ul := make([]byte, voiceFrame)
+	base := time.Now()
+	var ets []float64
+	for i := 0; i < 100; i++ { // 2 s of talking
+		now := base.Add(time.Duration(i) * 20 * time.Millisecond)
+		// RingLink polls every 0.5 s; LMU answers with its clock rounded down to 0.2 s
+		pollT := float64(int(float64(i)*0.02/0.5)) * 0.5
+		polled := base.Add(time.Duration(pollT * float64(time.Second)))
+		r.mu.Lock()
+		r.et, r.etAt, r.realtime = 50+float64(int(pollT/0.2))*0.2, polled, true
+		r.mu.Unlock()
+		r.recordAt(now, 1, ul, nil)
+		r.mu.Lock()
+		ets = append(ets, r.spkLast[1])
+		r.mu.Unlock()
+	}
+	for i := 1; i < len(ets); i++ {
+		if d := ets[i] - ets[i-1]; d < 0.019 || d > 0.021 {
+			t.Fatalf("frame %d spaced %.3f s from the previous one", i, d)
+		}
+	}
+}

@@ -101,6 +101,8 @@ var (
 	icRestore = mustIcon(icons.ActionRestore)
 	icExpand  = mustIcon(icons.NavigationExpandMore)
 	icLess    = mustIcon(icons.NavigationExpandLess)
+	icBcast   = mustIcon(icons.ActionRecordVoiceOver)
+	icKey     = mustIcon(icons.HardwareKeyboard)
 )
 
 var gameOptions = []struct {
@@ -125,6 +127,7 @@ type ui struct {
 	sens, vol, rng, muff       widget.Float
 	baseMuff, doppler          widget.Float
 	dirBtn, replayBtn          widget.Clickable
+	bcastBtn, bindBtn, unbind  widget.Clickable
 	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
 	copiedAt                   time.Time
@@ -347,6 +350,26 @@ func (u *ui) update(gtx layout.Context) {
 		a.Voice.Replay.SetEnabled(on)
 		a.S.ReplayVoice = &on
 		save = true
+	}
+	if u.bcastBtn.Clicked(gtx) {
+		a.Voice.BcastBtn.Store(!a.Voice.BcastBtn.Load())
+		a.Voice.KickPos()
+	}
+	if u.bindBtn.Clicked(gtx) {
+		if a.Bind.Capturing() {
+			a.Bind.CancelCapture()
+		} else {
+			a.Bind.Capture()
+		}
+	}
+	if u.unbind.Clicked(gtx) {
+		a.Bind.CancelCapture()
+		a.Bind.SetBind("")
+		a.S.BcastBind = ""
+		save = true
+	}
+	if a.Bind.Capturing() {
+		redrawIn(gtx, 10) // until the press arrives
 	}
 	if u.dirBtn.Clicked(gtx) {
 		on := !a.Voice.Direct.Load()
@@ -1183,6 +1206,33 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 						layout.Rigid(u.button(&u.voiceBtn, icPower, voiceLbl, voiceKind, false)),
 					)
 				},
+				vgap(10),
+				func(gtx layout.Context) layout.Dimensions {
+					lbl, kind := "Broadcast to everyone", btnSecondary
+					if v.BcastBtn.Load() {
+						lbl, kind = "Broadcasting — tap to stop", btnPrimary
+					} else if v.BcastKey.Load() {
+						lbl, kind = "Broadcasting (button held)", btnPrimary
+					}
+					return u.button(&u.bcastBtn, icBcast, lbl, kind, true)(gtx)
+				},
+				vgap(8),
+				func(gtx layout.Context) layout.Dimensions {
+					name := bindName(u.app.Bind.Bind())
+					if u.app.Bind.Capturing() {
+						name = "Press a key or wheel button…"
+					}
+					ws := []layout.FlexChild{
+						layout.Flexed(1, u.label(13.5, "Push-to-broadcast", colText)),
+						layout.Rigid(u.button(&u.bindBtn, icKey, name, btnGhost, false)),
+					}
+					if u.app.Bind.Bind() != "" {
+						ws = append(ws, layout.Rigid(layout.Spacer{Width: 6}.Layout),
+							layout.Rigid(u.button(&u.unbind, icRemove, "Clear", btnGhost, false)))
+					}
+					return layout.Flex{Alignment: layout.Middle}.Layout(gtx, ws...)
+				},
+				u.caption(bindCaption()),
 				vgap(14),
 			)
 		}
@@ -1191,6 +1241,8 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 			status := "Quiet"
 			if muted {
 				lvlC, status = colWarn, "Muted"
+			} else if vs.Talking && v.Broadcasting() {
+				lvlC, status = colGood, "Broadcasting"
 			} else if vs.Talking {
 				lvlC, status = colGood, "Sending"
 			}

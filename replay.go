@@ -67,6 +67,8 @@ type ReplayVoice struct {
 	lastT      float64
 	playingNow bool
 	loadTry    time.Time
+	spkLast    map[uint64]float64 // last timestamp written per speaker (keeps a burst evenly spaced)
+	cursor     int                // next recorded frame to hand out during a replay
 	// the car the replay camera is following (the listener while watching)
 	lisPos  *vec3
 	lisHead [2]float64
@@ -207,15 +209,19 @@ func (r *ReplayVoice) liveETLocked(now time.Time) (float64, bool) {
 	if !r.realtime || r.etAt.IsZero() || now.Sub(r.etAt) > 2*time.Second {
 		return 0, false
 	}
-	return r.et + now.Sub(r.etAt).Seconds(), true
+	// the reported value lags the real clock by up to one 0.2 s step: aim for the middle
+	return r.et + 0.1 + now.Sub(r.etAt).Seconds(), true
 }
 
 // Record stores one 20 ms voice frame (mu-law) heard or spoken live.
 func (r *ReplayVoice) Record(speaker uint64, ulaw []byte, pos *vec3) {
+	r.recordAt(time.Now(), speaker, ulaw, pos)
+}
+
+func (r *ReplayVoice) recordAt(now time.Time, speaker uint64, ulaw []byte, pos *vec3) {
 	if r == nil || !r.Enabled() || len(ulaw) != voiceFrame {
 		return
 	}
-	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	et, ok := r.liveETLocked(now)
@@ -236,6 +242,17 @@ func (r *ReplayVoice) Record(speaker uint64, ulaw []byte, pos *vec3) {
 		r.rec = f
 		r.pruneLocked()
 	}
+	// LMU's session clock only moves in 0.2 s steps, so within a stretch of talking
+	// stamp frames exactly 20 ms apart and only resync if we drift far off
+	if r.spkLast == nil {
+		r.spkLast = map[uint64]float64{}
+	}
+	if last, ok := r.spkLast[speaker]; ok && et-last < 0.3 && et-last > -0.3 {
+		if next := last + 0.02; math.Abs(et-next) < 0.25 {
+			et = next
+		}
+	}
+	r.spkLast[speaker] = et
 	b := make([]byte, recFrameBytes)
 	binary.LittleEndian.PutUint64(b, math.Float64bits(et))
 	binary.LittleEndian.PutUint64(b[8:], speaker)
@@ -312,19 +329,22 @@ func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 	}
 	t0 := r.lastT
 	r.lastT = t
-	if !normal || t < t0 || t-t0 > 0.5 { // paused, fast-forward/rewind or a jump: stay quiet
+	if !normal || t < t0 || t-t0 > 0.5 { // paused, fast-forward/rewind or a jump: stay quiet and re-aim
+		r.cursor = sort.Search(len(r.frames), func(i int) bool { return r.frames[i].et >= t })
 		r.playingNow = false
 		return nil
 	}
-	i := sort.Search(len(r.frames), func(i int) bool { return r.frames[i].et >= t0 })
+	if r.cursor > len(r.frames) {
+		r.cursor = len(r.frames)
+	}
+	// hand out every frame whose time has come, in order; the mixer queues them per
+	// speaker and plays them back to back, so timing wobble doesn't drop or bunch audio
 	var out []ReplayVoiceFrame
-	seen := map[uint64]bool{}
-	for ; i < len(r.frames) && r.frames[i].et < t; i++ {
-		f := r.frames[i]
-		if seen[f.speaker] {
-			continue
+	for ; r.cursor < len(r.frames) && r.frames[r.cursor].et < t; r.cursor++ {
+		f := r.frames[r.cursor]
+		if f.et < t-0.5 {
+			continue // stale (just loaded or caught up after a hiccup)
 		}
-		seen[f.speaker] = true
 		fr := make([]int16, voiceFrame)
 		for k := range fr {
 			fr[k] = uLawToLinear(f.data[k])
@@ -351,7 +371,7 @@ func (r *ReplayVoice) ensureLoadedLocked(t float64) bool {
 	for _, p := range m {
 		fr := readRecording(p)
 		if len(fr) > 0 && t >= fr[0].et-30 && t <= fr[len(fr)-1].et+30 {
-			r.loaded, r.frames = p, fr
+			r.loaded, r.frames, r.cursor = p, fr, sort.Search(len(fr), func(i int) bool { return fr[i].et >= t })
 			return true
 		}
 	}
