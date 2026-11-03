@@ -31,25 +31,32 @@ func TestReplayVoiceRoundTrip(t *testing.T) {
 	r.closeRecLocked()
 	r.realtime = false // now watching the replay
 	r.mu.Unlock()
-	// replay shows session time 100.2 s, playing at normal speed
-	now := time.Now()
-	r.onReplayPos(100.2, now)
-	r.onReplayPos(100.22, now.Add(20*time.Millisecond))
-	got := 0
-	for k := 0; k < 25; k++ { // 0.5 s of mixer frames
-		at := now.Add(time.Duration(20+20*k) * time.Millisecond)
-		r.mu.Lock()
-		r.rpAt = at // keep the replay feed "fresh"
-		r.rpET = 100.22 + float64(k)*0.02
-		r.mu.Unlock()
+	// watching: LMU sends the replay position ~15 times a second, unevenly, and the
+	// position only moves in 0.2 s steps. Replay starts at 99 s.
+	base := time.Now()
+	got, last := 0, -1
+	gaps := 0
+	nextMsg := 0.0
+	for k := 0; k < 150; k++ { // 3 s of mixer frames
+		w := float64(k) * 0.02
+		at := base.Add(time.Duration(w * float64(time.Second)))
+		if w >= nextMsg {
+			et := 99 + math.Floor(w/0.2)*0.2
+			r.onReplayPos(et, at)
+			nextMsg += 0.05 + 0.04*float64(k%3) // 50..130 ms apart
+		}
 		for _, f := range r.Frames(at) {
 			if f.PCM[10] > 4000 && f.Pos != nil && f.Pos.Y == 2 {
 				got++
+				if last >= 0 && k-last > 3 {
+					gaps++
+				}
+				last = k
 			}
 		}
 	}
-	if got < 18 {
-		t.Fatalf("played back %d recorded frames during 0.5 s of replay, want ~24", got)
+	if got < 40 || gaps > 0 {
+		t.Fatalf("played back %d of 50 recorded frames, %d gaps", got, gaps)
 	}
 	// paused replay: nothing plays
 	r.mu.Lock()

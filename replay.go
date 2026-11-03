@@ -12,7 +12,6 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -59,12 +58,15 @@ type ReplayVoice struct {
 	rec     *os.File
 	recLast float64
 	// replay position from the websocket
-	rpET    float64 // session ET shown by the replay at rpAt
-	rpAt    time.Time
-	rpSpeed float64
-	rpStart float64 // the replay's first session ET and length: tells which session it is
-	rpLen   float64
-	loadKey string // replay (track, start, length) the loaded recording was picked for
+	rpET      float64 // replay clock: session ET shown at rpAt (smoothed)
+	rpAt      time.Time
+	rpSpeed   float64
+	rpSeen    time.Time // last position message
+	rpHist    []rpSample
+	loadStart float64 // replay start ET the loaded recording was picked for
+	rpStart   float64 // the replay's first session ET and length: tells which session it is
+	rpLen     float64
+	loadKey   string // track the loaded recording was picked for
 	// loaded recording for playback
 	loaded     string
 	frames     []recFrame // sorted by et
@@ -202,16 +204,64 @@ func (r *ReplayVoice) replayLoop(stop chan struct{}) {
 	}
 }
 
+// snapSpeed: LMU's replay speeds are fixed steps, and the measured trend wobbles a few
+// percent, so round to the nearest step (otherwise the voice pitch would waver).
+func snapSpeed(sp float64) float64 {
+	if math.Abs(sp) < 0.08 {
+		return 0
+	}
+	for _, st := range []float64{0.125, 0.25, 0.5, 1, 2, 4, 8} {
+		if math.Abs(sp-st) <= 0.12*st {
+			return st
+		}
+	}
+	return sp
+}
+
+type rpSample struct {
+	at time.Time
+	et float64
+}
+
+// onReplayPos turns LMU's replay position messages into a smooth clock. The messages
+// can come unevenly and the position can move in steps, so the speed is the trend over
+// the last 2 s and small errors are eased out instead of jumping (a jump back would
+// stop the voice). Real seeks (more than about half a second off) jump straight there.
 func (r *ReplayVoice) onReplayPos(et float64, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.rpAt.IsZero() {
-		if dt := now.Sub(r.rpAt).Seconds(); dt > 0.01 && dt < 1 {
-			s := (et - r.rpET) / dt
-			r.rpSpeed = 0.7*r.rpSpeed + 0.3*s
+	r.rpHist = append(r.rpHist, rpSample{now, et})
+	for len(r.rpHist) > 2 && now.Sub(r.rpHist[0].at) > 2*time.Second {
+		r.rpHist = r.rpHist[1:]
+	}
+	first := r.rpSeen.IsZero() || now.Sub(r.rpSeen) > 2*time.Second
+	r.rpSeen = now
+	if first {
+		r.rpET, r.rpAt, r.rpSpeed = et, now, 0
+		r.rpHist = r.rpHist[len(r.rpHist)-1:]
+		return
+	}
+	pred := r.rpET + r.rpSpeed*now.Sub(r.rpAt).Seconds()
+	errT := et - pred
+	if math.Abs(errT) > math.Max(0.6, 0.3*math.Abs(r.rpSpeed)) { // seek / jump
+		r.rpET, r.rpAt = et, now
+		r.rpHist = r.rpHist[len(r.rpHist)-1:]
+		return
+	}
+	r.rpET, r.rpAt = pred+0.15*errT, now
+	// speed: least-squares slope of the recent positions
+	h := r.rpHist
+	if span := h[len(h)-1].at.Sub(h[0].at).Seconds(); span >= 0.4 && len(h) >= 3 {
+		var sx, sy, sxx, sxy float64
+		for _, q := range h {
+			x := q.at.Sub(h[0].at).Seconds()
+			sx, sy, sxx, sxy = sx+x, sy+q.et, sxx+x*x, sxy+x*q.et
+		}
+		n := float64(len(h))
+		if d := n*sxx - sx*sx; d > 1e-9 {
+			r.rpSpeed = snapSpeed((n*sxy - sx*sy) / d)
 		}
 	}
-	r.rpET, r.rpAt = et, now
 }
 
 // liveETLocked is the current session time while driving (false when unknown / in a replay).
@@ -313,7 +363,7 @@ func safeName(s string) string {
 // replayTimeLocked: the session time the replay is showing right now, and whether
 // it's playing at (about) normal speed.
 func (r *ReplayVoice) replayTimeLocked(now time.Time) (et float64, normal, active bool) {
-	if r.realtime || r.rpAt.IsZero() || now.Sub(r.rpAt) > 600*time.Millisecond {
+	if r.realtime || r.rpSeen.IsZero() || now.Sub(r.rpSeen) > 800*time.Millisecond {
 		return 0, false, false
 	}
 	sp := r.rpSpeed
@@ -363,6 +413,9 @@ func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 		return nil
 	}
 	t0 := r.lastT
+	if t < t0 && t > t0-0.15 { // the clock eased back a touch: just wait for it
+		return nil
+	}
 	r.lastT = t
 	if !normal || t < t0 || t-t0 > 0.5*math.Max(1, r.rpSpeed) { // paused, rewind or a jump: stay quiet and re-aim
 		r.cursor = sort.Search(len(r.frames), func(i int) bool { return r.frames[i].et >= t })
@@ -396,19 +449,19 @@ func (r *ReplayVoice) Frames(now time.Time) []ReplayVoiceFrame {
 // and the one that fills the span best wins (newest on a tie). Works after
 // restarting the game or RingLink, since recordings are files.
 func (r *ReplayVoice) ensureLoadedLocked(t float64) bool {
-	key := fmt.Sprintf("%s|%.0f|%.0f", safeName(r.track), r.rpStart, r.rpLen)
 	n := len(r.frames)
-	if n > 0 && key == r.loadKey && t >= r.frames[0].et-30 && t <= r.frames[n-1].et+30 {
+	covers := n > 0 && t >= r.frames[0].et-30 && t <= r.frames[n-1].et+30
+	// keep the loaded recording while it covers this moment of the same replay
+	// (LMU's numbers wobble a little, so only a clearly different replay re-picks)
+	if covers && r.loadKey == safeName(r.track) && math.Abs(r.loadStart-r.rpStart) < 5 {
 		return true
 	}
 	if time.Since(r.loadTry) < 3*time.Second {
-		return n > 0 && key == r.loadKey && t >= r.frames[0].et-30 && t <= r.frames[n-1].et+30
+		return covers
 	}
 	r.loadTry = time.Now()
-	r.frames, r.loaded = nil, ""
 	m, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv2"))
 	best, bestScore := "", -1.0
-	var bestFr []recFrame
 	sameTrack := 0
 	for _, p := range m {
 		if strings.HasSuffix(filepath.Base(p), "_"+safeName(r.track)+".rlv2") {
@@ -420,13 +473,12 @@ func (r *ReplayVoice) ensureLoadedLocked(t float64) bool {
 		if r.track != "" && sameTrack > 0 && !strings.HasSuffix(filepath.Base(p), "_"+safeName(r.track)+".rlv2") {
 			continue
 		}
-		fr := readRecording(p)
-		if len(fr) == 0 || t < fr[0].et-30 || t > fr[len(fr)-1].et+30 {
+		a, b, ok := recordingSpan(p)
+		if !ok || t < a-30 || t > b+30 {
 			continue
 		}
 		score := 1.0
 		if r.rpLen > 0 { // how much of the recording lies inside the replay
-			a, b := fr[0].et, fr[len(fr)-1].et
 			lo, hi := math.Max(a, r.rpStart-5), math.Min(b, r.rpStart+r.rpLen+5)
 			inside := math.Max(0, hi-lo) / math.Max(1, b-a)
 			if inside < 0.5 {
@@ -437,15 +489,49 @@ func (r *ReplayVoice) ensureLoadedLocked(t float64) bool {
 			score = inside + math.Min(1, (b-a)/r.rpLen)
 		}
 		if score > bestScore+1e-9 || math.Abs(score-bestScore) <= 1e-9 && p > best {
-			best, bestScore, bestFr = p, score, fr
+			best, bestScore = p, score
 		}
 	}
 	if best == "" {
-		return false
+		return covers
 	}
-	r.loaded, r.frames, r.loadKey = best, bestFr, key
-	r.cursor = sort.Search(len(bestFr), func(i int) bool { return bestFr[i].et >= t })
+	if best != r.loaded || !covers {
+		fr := readRecording(best)
+		if len(fr) == 0 {
+			return covers
+		}
+		r.loaded, r.frames = best, fr
+		r.cursor = sort.Search(len(fr), func(i int) bool { return fr[i].et >= t })
+	}
+	r.loadKey, r.loadStart = safeName(r.track), r.rpStart
 	return true
+}
+
+// recordingSpan: first and last session time in a recording, without reading it all.
+func recordingSpan(p string) (first, last float64, ok bool) {
+	f, err := os.Open(p)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() < recFrameBytes {
+		return 0, 0, false
+	}
+	b := make([]byte, 8)
+	if _, err := f.ReadAt(b, 0); err != nil {
+		return 0, 0, false
+	}
+	first = math.Float64frombits(binary.LittleEndian.Uint64(b))
+	lastOff := (st.Size()/recFrameBytes - 1) * recFrameBytes
+	if _, err := f.ReadAt(b, lastOff); err != nil {
+		return 0, 0, false
+	}
+	last = math.Float64frombits(binary.LittleEndian.Uint64(b))
+	if last < first {
+		first, last = last, first
+	}
+	return first, last, true
 }
 
 func readRecording(p string) []recFrame {
