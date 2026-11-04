@@ -1749,18 +1749,14 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 			)
 		}
 		fxOpen := u.app.S.FXOpen
-		ws = append(ws, u.fxField(fxOpen))
-		if !fxOpen {
-			ws = append(ws, vgap(10), u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."))
-			return col(gtx, ws...)
-		}
-		ws = append(ws, vgap(10), func(gtx layout.Context) layout.Dimensions {
+		var items []layout.Widget
+		items = append(items, vgap(6), func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 				layout.Flexed(1, u.caption("How everyone else sounds to you.")),
 				layout.Rigid(u.button(&u.resetFX, icRestore, "Reset", btnGhost, false)),
 			)
 		})
-		ws = append(ws,
+		items = append(items,
 			u.sliderRow("Volume", fmt.Sprintf("%d%%", v.VolPct.Load()), &u.vol),
 			vgap(6),
 			u.sliderRow("How far voices carry", fmt.Sprintf("%d m", v.RangeM.Load()), &u.rng),
@@ -1798,7 +1794,13 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 				)
 			},
 			u.caption(replayCaption(v.Replay)),
-			vgap(12),
+			vgap(4),
+		)
+		ws = append(ws,
+			func(gtx layout.Context) layout.Dimensions {
+				return u.dropdown(gtx, "drop:fx", fxOpen, u.fxField(fxOpen), items)
+			},
+			vgap(10),
 			u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."),
 		)
 		return col(gtx, ws...)
@@ -1946,11 +1948,8 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 			call.Add(gtx.Ops)
 			return d
 		}
-		if !open {
-			return field(gtx)
-		}
-		ws := []layout.Widget{field, vgap(4)}
-		fade := u.an.to(gtx, "open:"+title, 1, 14)
+		var ws []layout.Widget
+		fade := float32(1)
 		if len(list) <= 1 {
 			ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 				return layout.Inset{Left: 14, Top: 4}.Layout(gtx, u.caption("No other devices found."))
@@ -1992,8 +1991,51 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 				})
 			})
 		}
-		return col(gtx, ws...)
+		return u.dropdown(gtx, "drop:"+title, open, field, ws)
 	}
+}
+
+// dropdown draws a field and, when open, the items under it. Opening, the panel
+// unrolls out of the field and the items slide down and fade in one after another
+// (like the cards at startup); closing plays it backwards.
+func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Widget, items []layout.Widget) layout.Dimensions {
+	target := float32(0)
+	if open {
+		target = 1
+	}
+	p := u.an.to(gtx, key, target, 9)
+	fd := field(gtx)
+	if p < 0.002 || len(items) == 0 {
+		return fd
+	}
+	n := float32(len(items))
+	gap := gtx.Dp(4)
+	// lay the items out once (recorded) to know how tall the open panel is
+	macro := op.Record(gtx.Ops)
+	cgtx := gtx
+	cgtx.Constraints.Min.Y = 0
+	y := 0
+	for i, it := range items {
+		// each item starts a little after the one above it
+		ti := min(1, max(0, p*1.5-0.5*float32(i)/n))
+		ti = 1 - (1-ti)*(1-ti)*(1-ti) // ease-out cubic
+		st := op.Offset(image.Pt(0, y+int((1-ti)*float32(-gtx.Dp(14))))).Push(cgtx.Ops)
+		fd := paint.PushOpacity(cgtx.Ops, ti)
+		d := it(cgtx)
+		fd.Pop()
+		st.Pop()
+		y += d.Size.Y
+	}
+	content := macro.Stop()
+	full := y + gap
+	vis := int(float32(full) * (1 - (1-p)*(1-p))) // the panel unrolls with an ease-out
+	// reveal from the field's bottom edge downward, as if it comes out of the button
+	stack := op.Offset(image.Pt(0, fd.Size.Y+gap)).Push(gtx.Ops)
+	cl := clip.Rect{Max: image.Pt(gtx.Constraints.Max.X, vis-gap)}.Push(gtx.Ops)
+	content.Add(gtx.Ops)
+	cl.Pop()
+	stack.Pop()
+	return layout.Dimensions{Size: image.Pt(fd.Size.X, fd.Size.Y+vis)}
 }
 
 // shortDevice makes a raw sound-server name a bit friendlier.
