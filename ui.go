@@ -133,6 +133,8 @@ type ui struct {
 	bindBtns, unbindBtns       map[string]*widget.Clickable // per action
 	pttBtn, fxBtn              widget.Clickable
 	mem                        map[uint64]*memUI // per person in the room
+	drops                      map[string]*dropState
+	dropBlocks                 map[string]int // how many blocks each dropdown has (for its timing)
 	pitBtn, addSub, stopIso    widget.Clickable
 	subEd                      widget.Editor
 	subPick, subDel            map[string]*widget.Clickable
@@ -1798,7 +1800,7 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 		)
 		ws = append(ws,
 			func(gtx layout.Context) layout.Dimensions {
-				return u.dropdown(gtx, "drop:fx", fxOpen, u.fxField(fxOpen), items)
+				return u.dropdown(gtx, "drop:fx", fxOpen, u.fxField(fxOpen), items, false)
 			},
 			vgap(10),
 			u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."),
@@ -1991,51 +1993,162 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 				})
 			})
 		}
-		return u.dropdown(gtx, "drop:"+title, open, field, ws)
+		return u.dropdown(gtx, "drop:"+title, open, field, ws, true)
 	}
 }
 
-// dropdown draws a field and, when open, the items under it. Opening, the panel
-// unrolls out of the field and the items slide down and fade in one after another
-// (like the cards at startup); closing plays it backwards.
-func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Widget, items []layout.Widget) layout.Dimensions {
-	target := float32(0)
-	if open {
-		target = 1
+// dropState: when a dropdown was last opened or closed.
+type dropState struct {
+	open bool
+	at   time.Time
+	seen bool
+}
+
+// dropdown draws a field and, when open, the rows under it. The rows wait in a line
+// inside the button, invisible. One after another each one launches: it lifts up
+// toward you off the page (blurred, a little bigger) and pulls down into its place,
+// sharp once it lands. Closing sends them back in reverse order.
+func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Widget, items []layout.Widget, perRow bool) layout.Dimensions {
+	if u.drops == nil {
+		u.drops = map[string]*dropState{}
 	}
-	p := u.an.to(gtx, key, target, 9)
+	ds := u.drops[key]
+	if ds == nil {
+		ds = &dropState{open: open, at: gtx.Now.Add(-time.Hour)} // already settled at startup
+		u.drops[key] = ds
+	}
+	if ds.open != open {
+		ds.open, ds.at = open, gtx.Now
+	}
+	n := len(items)
+	const flight = 0.22 // seconds for one block's trip
+	// the next block launches when the one before is halfway down
+	stagger := flight * 0.45
+	blocks := 0
+	if u.dropBlocks != nil {
+		blocks = u.dropBlocks[key]
+	}
+	total := flight + stagger*float64(max(0, blocks-1))
+	el := gtx.Now.Sub(ds.at).Seconds()
+	if el < total {
+		redrawIn(gtx, 60)
+	}
+	// row i's progress: 0 = in the button, 1 = in place
+	prog := func(i int) float32 {
+		k := i
+		if !open {
+			k = n - 1 - i // last block leaves first
+		}
+		t := float32(math.Min(1, math.Max(0, (el-stagger*float64(k))/flight)))
+		if !open {
+			t = 1 - t
+		}
+		return t
+	}
+	fm := op.Record(gtx.Ops)
 	fd := field(gtx)
-	if p < 0.002 || len(items) == 0 {
+	fieldCall := fm.Stop()
+	if n == 0 || !open && el >= total {
+		fieldCall.Add(gtx.Ops)
 		return fd
 	}
-	n := float32(len(items))
 	gap := gtx.Dp(4)
-	// lay the items out once (recorded) to know how tall the open panel is
-	macro := op.Record(gtx.Ops)
 	cgtx := gtx
 	cgtx.Constraints.Min.Y = 0
-	y := 0
+	type rec struct {
+		call op.CallOp
+		size image.Point
+		y    int
+	}
+	// rows travel in blocks: everything up to the next small gap goes together
+	// (e.g. a slider with its label and caption)
+	var recs []rec
+	y, gy := 0, 0
+	m := op.Record(cgtx.Ops)
 	for i, it := range items {
-		// each item starts a little after the one above it
-		ti := min(1, max(0, p*1.5-0.5*float32(i)/n))
-		ti = 1 - (1-ti)*(1-ti)*(1-ti) // ease-out cubic
-		st := op.Offset(image.Pt(0, y+int((1-ti)*float32(-gtx.Dp(14))))).Push(cgtx.Ops)
-		fd := paint.PushOpacity(cgtx.Ops, ti)
+		st := op.Offset(image.Pt(0, y-gy)).Push(cgtx.Ops)
 		d := it(cgtx)
-		fd.Pop()
 		st.Pop()
 		y += d.Size.Y
+		if perRow || d.Size.Y <= gtx.Dp(12) || i == len(items)-1 {
+			recs = append(recs, rec{m.Stop(), image.Pt(cgtx.Constraints.Max.X, y-gy), gy})
+			gy = y
+			if i < len(items)-1 {
+				m = op.Record(cgtx.Ops)
+			}
+		}
 	}
-	content := macro.Stop()
-	full := y + gap
-	vis := int(float32(full) * (1 - (1-p)*(1-p))) // the panel unrolls with an ease-out
-	// reveal from the field's bottom edge downward, as if it comes out of the button
-	stack := op.Offset(image.Pt(0, fd.Size.Y+gap)).Push(gtx.Ops)
-	cl := clip.Rect{Max: image.Pt(gtx.Constraints.Max.X, vis-gap)}.Push(gtx.Ops)
-	content.Add(gtx.Ops)
+	n = len(recs)
+	if u.dropBlocks == nil {
+		u.dropBlocks = map[string]int{}
+	}
+	u.dropBlocks[key] = n
+	top := fd.Size.Y + gap
+	// room taken so far: grows as rows land
+	shown := 0
+	for i, r := range recs {
+		t := prog(i)
+		e := t * t * (3 - 2*t)
+		if e > 0 {
+			shown = max(shown, r.y+int(float32(r.size.Y)*e))
+		}
+	}
+	draw := func(i int) {
+		r := recs[i]
+		t := prog(i)
+		if t <= 0 {
+			return // still in line inside the button: invisible
+		}
+		e := t * t * (3 - 2*t)                                 // quickest mid-flight
+		lift := float32(math.Sin(math.Pi * float64(e)))        // how far off the page
+		startY := float32(-top - r.y + (fd.Size.Y-r.size.Y)/2) // centred in the button
+		dy := int(startY * (1 - e))
+		sc := 0.9 + 0.1*e + 0.08*lift
+		// fades in while still behind the button, fully there once it's out
+		a := min(1, t/0.45)
+		alpha := a * a * (3 - 2*a)
+		// blurry behind the button and coming out, sharp as it lands
+		blurAmt := max(lift, float32(math.Pow(float64(1-e), 0.6)))
+		st := op.Offset(image.Pt(0, top+r.y+dy)).Push(gtx.Ops)
+		aff := op.Affine(scaleAbout(r.size, sc)).Push(gtx.Ops)
+		if b := int(blurAmt*float32(gtx.Dp(3)) + 0.5); b < 1 {
+			o := paint.PushOpacity(gtx.Ops, alpha)
+			r.call.Add(gtx.Ops)
+			o.Pop()
+		} else {
+			// soft blur while it's up off the page: drawn a few times, slightly spread
+			for k, off := range []image.Point{{0, 0}, {-b, 0}, {b, 0}, {0, -b}, {0, b}} {
+				w := float32(0.2)
+				if k == 0 {
+					w = 0.4
+				}
+				o := paint.PushOpacity(gtx.Ops, alpha*w)
+				oo := op.Offset(off).Push(gtx.Ops)
+				r.call.Add(gtx.Ops)
+				oo.Pop()
+				o.Pop()
+			}
+		}
+		aff.Pop()
+		st.Pop()
+	}
+	// blocks start under the button (it's glass, so they fade in behind it) and never
+	// show above its top edge; the button is drawn over them
+	cl := clip.Rect{Min: image.Pt(-gtx.Dp(8), 0), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(8), top+shown+gtx.Dp(8))}.Push(gtx.Ops)
+	// landed blocks first, blocks in the air on top of them, the button over everything
+	for i := range recs {
+		if prog(i) >= 1 {
+			draw(i)
+		}
+	}
+	for i := range recs {
+		if t := prog(i); t > 0 && t < 1 {
+			draw(i)
+		}
+	}
 	cl.Pop()
-	stack.Pop()
-	return layout.Dimensions{Size: image.Pt(fd.Size.X, fd.Size.Y+vis)}
+	fieldCall.Add(gtx.Ops)
+	return layout.Dimensions{Size: image.Pt(fd.Size.X, fd.Size.Y+gap*min(1, shown)+shown)}
 }
 
 // shortDevice makes a raw sound-server name a bit friendlier.
