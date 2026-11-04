@@ -2001,15 +2001,18 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 type dropState struct {
 	open bool
 	at   time.Time
-	from float32 // belt position when it last changed direction
-	dur  float64 // seconds for a full trip
+	from float32     // belt position when it last changed direction
+	dur  float64     // seconds for a full trip
+	out  []time.Time // when each row came out of the button (for its rise to the glass)
 }
 
 // dropdown draws a field and, when open, the rows under it. Opening works like a
 // conveyor belt: the rows feed out of the button together (the bottom of the list
-// comes out first and leads the way down) and are only revealed as they pass the
-// button's bottom edge, fading in. They blur with speed (most mid-way) and are sharp
-// when the belt stops. Closing pulls the belt back up into the button.
+// comes out first and leads the way down), with a little overshoot as it stops. Each
+// row is only revealed as it passes the button's bottom edge, and then rises to the
+// page like something coming up to frosted glass: blurred all round, a bit smaller and
+// faint at first, sharp and full size (with a small pop) once it's at the surface.
+// Closing pulls the belt back up into the button.
 func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Widget, items []layout.Widget, perRow bool) layout.Dimensions {
 	_ = perRow
 	if u.drops == nil {
@@ -2025,6 +2028,9 @@ func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Wi
 		cur := ds.prog(gtx.Now)
 		ds.open, ds.at = open, gtx.Now
 		ds.from = cur
+		if open {
+			ds.out = nil
+		}
 	}
 	fm := op.Record(gtx.Ops)
 	fd := field(gtx)
@@ -2051,55 +2057,89 @@ func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Wi
 	}
 	full := y + gap
 	// a longer list takes a little longer to feed out
-	ds.dur = math.Min(0.75, 0.32+float64(full)/float64(gtx.Dp(1600)))
+	ds.dur = math.Min(0.8, 0.36+float64(full)/float64(gtx.Dp(1500)))
 	p := ds.prog(gtx.Now)
-	if p != 0 && p != 1 {
-		redrawIn(gtx, 60)
-	}
 	if p <= 0 {
 		fieldCall.Add(gtx.Ops)
 		return fd
 	}
-	e := p * p * (3 - 2*p)              // the belt speeds up, then slows to a stop
-	speed := 6 * p * (1 - p) / 1.5      // 0..1, most mid-way
+	// belt position with a little overshoot when it stops (open), plain ease when closing
+	var e float32
+	if open {
+		const c = 1.25 // overshoot amount
+		q := p - 1
+		e = 1 + (c+1)*q*q*q + c*q*q
+	} else {
+		e = p * p * (3 - 2*p)
+	}
 	dy := int(-float32(full) * (1 - e)) // the whole list moves together
-	shown := int(float32(full) * e)
+	shown := max(0, int(float32(full)*e))
 	top := fd.Size.Y + gap
 	edge := fd.Size.Y
-	fadeLen := float32(gtx.Dp(36))
-	// only what has come out past the button's bottom edge shows; the button hides the rest
-	cl := clip.Rect{Min: image.Pt(-gtx.Dp(8), edge), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(8), top+shown+gtx.Dp(8))}.Push(gtx.Ops)
-	b := int(speed*float32(gtx.Dp(3)) + 0.5)
-	for _, r := range recs {
+	if len(ds.out) != len(recs) {
+		ds.out = make([]time.Time, len(recs))
+	}
+	const rise = 0.3 // seconds for a row to come up to the glass once it's out
+	busy := p < 1
+	cl := clip.Rect{Min: image.Pt(-gtx.Dp(12), edge), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(12), top+shown+gtx.Dp(12))}.Push(gtx.Ops)
+	for i, r := range recs {
 		ry := top + r.y + dy
 		if ry+r.size.Y <= edge {
+			ds.out[i] = time.Time{}
 			continue // still inside the button
 		}
-		// fades in as it comes out of the edge
-		a := min(1, max(0, float32(ry+r.size.Y/2-edge)/fadeLen))
-		alpha := a * a * (3 - 2*a)
+		// depth: 0 = deep behind the glass, 1 = at the surface
+		var depth float32
+		if open {
+			if ds.out[i].IsZero() {
+				ds.out[i] = gtx.Now
+			}
+			depth = float32(math.Min(1, gtx.Now.Sub(ds.out[i]).Seconds()/rise))
+		} else {
+			// closing: sinks back as it nears the button
+			depth = min(1, max(0, float32(ry+r.size.Y/2-edge)/float32(gtx.Dp(70))))
+		}
+		if depth < 1 {
+			busy = true
+		}
+		dz := depth * depth * (3 - 2*depth)
+		// pop: a touch over full size right as it reaches the glass, then settles
+		pop := float32(0)
+		if open {
+			pop = 0.035 * float32(math.Sin(math.Pi*float64(min(1, max(0, (depth-0.55)/0.45)))))
+		}
+		sc := 0.9 + 0.1*dz + pop
+		alpha := 0.25 + 0.75*dz
+		radius := (1 - dz) * float32(gtx.Dp(5))
 		st := op.Offset(image.Pt(0, ry)).Push(gtx.Ops)
-		if b < 1 {
+		aff := op.Affine(scaleAbout(r.size, sc)).Push(gtx.Ops)
+		if radius < 0.7 {
 			o := paint.PushOpacity(gtx.Ops, alpha)
 			r.call.Add(gtx.Ops)
 			o.Pop()
 		} else {
-			// motion blur: spread along the direction it's moving (down)
-			for k, off := range []int{0, -b, b, -2 * b} {
-				w := float32(0.22)
-				if k == 0 {
-					w = 0.4
-				}
-				o := paint.PushOpacity(gtx.Ops, alpha*w*1.05)
-				oo := op.Offset(image.Pt(0, off)).Push(gtx.Ops)
+			// frosted-glass blur: copies spread evenly all round, softer the deeper it is
+			const ring = 8
+			o := paint.PushOpacity(gtx.Ops, alpha*0.3)
+			r.call.Add(gtx.Ops)
+			o.Pop()
+			for k := 0; k < ring; k++ {
+				ang := 2 * math.Pi * float64(k) / ring
+				off := image.Pt(int(float64(radius)*math.Cos(ang)), int(float64(radius)*math.Sin(ang)))
+				o := paint.PushOpacity(gtx.Ops, alpha*0.7/ring*1.6)
+				oo := op.Offset(off).Push(gtx.Ops)
 				r.call.Add(gtx.Ops)
 				oo.Pop()
 				o.Pop()
 			}
 		}
+		aff.Pop()
 		st.Pop()
 	}
 	cl.Pop()
+	if busy {
+		redrawIn(gtx, 60)
+	}
 	fieldCall.Add(gtx.Ops)
 	return layout.Dimensions{Size: image.Pt(fd.Size.X, fd.Size.Y+shown)}
 }
