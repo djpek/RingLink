@@ -13,23 +13,28 @@ import (
 const appVersion = "3.0"
 
 type Settings struct {
-	DisplayName string `json:"displayName"`
-	MaxPeople   int    `json:"maxPeople"`
-	Game        int    `json:"game"`                   // 0 auto, 1 LMU, 2 BeamNG
-	Opacity     int    `json:"opacity,omitempty"`      // background (or window) opacity %, 0 = unset (100)
-	PanelAlpha  int    `json:"panelOpacity,omitempty"` // panels & buttons opacity % when see-through, 0 = unset (90)
-	Voice       *bool  `json:"voice,omitempty"`
-	MicDevice   string `json:"micDevice,omitempty"`
-	SpkDevice   string `json:"speakerDevice,omitempty"`
-	VoiceSens   int    `json:"voiceSens,omitempty"`
-	VoiceVol    *int   `json:"voiceVol,omitempty"`
-	VoiceRange  *int   `json:"voiceRange,omitempty"`
-	VoiceMuff   *int   `json:"voiceMuffle,omitempty"`
-	VoiceBase   *int   `json:"voiceBaseMuffle,omitempty"`
-	VoiceDir    *bool  `json:"voiceDirectional,omitempty"`
-	VoiceDop    *int   `json:"voiceDoppler,omitempty"`
-	ReplayVoice *bool  `json:"replayVoice,omitempty"`
-	BcastBind   string `json:"broadcastBind,omitempty"` // push-to-broadcast key / wheel button
+	DisplayName string         `json:"displayName"`
+	MaxPeople   int            `json:"maxPeople"`
+	Game        int            `json:"game"`                   // 0 auto, 1 LMU, 2 BeamNG
+	Opacity     int            `json:"opacity,omitempty"`      // background (or window) opacity %, 0 = unset (100)
+	PanelAlpha  int            `json:"panelOpacity,omitempty"` // panels & buttons opacity % when see-through, 0 = unset (90)
+	Voice       *bool          `json:"voice,omitempty"`
+	MicDevice   string         `json:"micDevice,omitempty"`
+	SpkDevice   string         `json:"speakerDevice,omitempty"`
+	VoiceSens   int            `json:"voiceSens,omitempty"`
+	VoiceVol    *int           `json:"voiceVol,omitempty"`
+	VoiceRange  *int           `json:"voiceRange,omitempty"`
+	VoiceMuff   *int           `json:"voiceMuffle,omitempty"`
+	VoiceBase   *int           `json:"voiceBaseMuffle,omitempty"`
+	VoiceDir    *bool          `json:"voiceDirectional,omitempty"`
+	VoiceDop    *int           `json:"voiceDoppler,omitempty"`
+	ReplayVoice *bool          `json:"replayVoice,omitempty"`
+	BcastBind   string         `json:"broadcastBind,omitempty"` // push-to-broadcast key / wheel button
+	PTTBind     string         `json:"pushToTalkBind,omitempty"`
+	PTMBind     string         `json:"pushToMuteBind,omitempty"`
+	PushToTalk  bool           `json:"pushToTalk,omitempty"` // false = voice activated
+	FXClosed    bool           `json:"othersVoicesClosed,omitempty"`
+	PeerVol     map[string]int `json:"peerVolume,omitempty"` // per-person volume % by display name
 }
 
 type App struct {
@@ -71,16 +76,33 @@ func NewApp(notify func()) *App {
 	if a.S.ReplayVoice != nil {
 		a.Voice.Replay.SetEnabled(*a.S.ReplayVoice)
 	}
+	a.Voice.PTTMode.Store(a.S.PushToTalk)
 	a.Bind = NewBinder()
-	a.Bind.SetBind(a.S.BcastBind)
-	a.Bind.onChange = func(held bool) {
-		a.Voice.BcastKey.Store(held)
-		a.Voice.KickPos()
+	a.Bind.SetBind(actBroadcast, a.S.BcastBind)
+	a.Bind.SetBind(actPTT, a.S.PTTBind)
+	a.Bind.SetBind(actPTM, a.S.PTMBind)
+	a.Bind.onChange = func(act string, held bool) {
+		switch act {
+		case actBroadcast:
+			a.Voice.BcastKey.Store(held)
+			a.Voice.KickPos()
+		case actPTT:
+			a.Voice.PTTKey.Store(held)
+		case actPTM:
+			a.Voice.PTMKey.Store(held)
+		}
 		a.poke()
 	}
-	a.Bind.onCapture = func(id string) {
+	a.Bind.onCapture = func(act, id string) {
 		a.mu.Lock()
-		a.S.BcastBind = id
+		switch act {
+		case actBroadcast:
+			a.S.BcastBind = id
+		case actPTT:
+			a.S.PTTBind = id
+		case actPTM:
+			a.S.PTMBind = id
+		}
 		a.mu.Unlock()
 		a.Save()
 		a.poke()
@@ -194,6 +216,14 @@ func (a *App) open(code string, creator bool) error {
 		live := map[uint64]bool{}
 		for _, m := range r.Members() {
 			live[m.ID] = true
+			if !m.Self {
+				a.mu.Lock()
+				pv, ok := a.S.PeerVol[m.Name] // your volume for them, remembered by name
+				a.mu.Unlock()
+				if ok {
+					a.Voice.SetPeerVolume(m.ID, pv)
+				}
+			}
 		}
 		for _, id := range a.Voice.PeerIDs() {
 			if !live[id] {
@@ -209,7 +239,7 @@ func (a *App) open(code string, creator bool) error {
 	a.Voice.SetSender(func(p []byte) {
 		// big rooms: voice only goes to people close enough to hear it; positions go
 		// to far-away people 2x a second instead of 10x (enough to know when they're near)
-		if len(p) == 0 || r.Size() <= cullRoomAbove {
+		if len(p) == 0 || r.Size() <= cullRoomAbove || p[0] == vkSettings {
 			r.SendVoice(p)
 			return
 		}

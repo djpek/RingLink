@@ -10,47 +10,63 @@ import (
 	"time"
 )
 
-// Binder watches keyboard / controller buttons and reports whether the bound one is held.
+// actions you can bind a key / wheel button to
+const (
+	actBroadcast = "broadcast" // everyone hears you at full volume while held
+	actPTT       = "ptt"       // push to talk
+	actPTM       = "ptm"       // push to mute
+)
+
+// Binder watches keyboard / controller buttons and reports which bound actions are held.
 type Binder struct {
 	mu        sync.Mutex
-	bind      string // e.g. "joy0:b5" or "key:66"; "" = none
-	capturing bool   // waiting for the next button press to become the binding
+	binds     map[string]string // action -> button id, e.g. "joy0:b5", "key:66"
+	capFor    string            // action waiting for its next button press ("" = none)
 	capBase   map[string]bool
 	capUntil  time.Time
-	held      bool
-	onChange  func(held bool)
-	onCapture func(id string)
+	held      map[string]bool
+	onChange  func(action string, held bool)
+	onCapture func(action, id string)
 }
 
-func NewBinder() *Binder { return &Binder{} }
+func NewBinder() *Binder { return &Binder{binds: map[string]string{}, held: map[string]bool{}} }
 
-func (b *Binder) Bind() string { b.mu.Lock(); defer b.mu.Unlock(); return b.bind }
-func (b *Binder) SetBind(id string) {
+func (b *Binder) Bind(action string) string { b.mu.Lock(); defer b.mu.Unlock(); return b.binds[action] }
+func (b *Binder) SetBind(action, id string) {
 	b.mu.Lock()
-	b.bind = id
+	if id == "" {
+		delete(b.binds, action)
+	} else {
+		b.binds[action] = id
+	}
 	b.mu.Unlock()
 }
-func (b *Binder) Capturing() bool {
+
+// CapturingFor: the action waiting for a button press, or "".
+func (b *Binder) CapturingFor() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.capturing && time.Now().Before(b.capUntil)
+	if b.capFor != "" && time.Now().Before(b.capUntil) {
+		return b.capFor
+	}
+	return ""
 }
 
-// Capture: the next button pressed (within 8 s) becomes the binding.
-func (b *Binder) Capture() {
+// Capture: the next button pressed (within 8 s) becomes action's binding.
+func (b *Binder) Capture(action string) {
 	b.mu.Lock()
-	b.capturing, b.capBase, b.capUntil = true, nil, time.Now().Add(8*time.Second)
+	b.capFor, b.capBase, b.capUntil = action, nil, time.Now().Add(8*time.Second)
 	b.mu.Unlock()
 }
-func (b *Binder) CancelCapture() { b.mu.Lock(); b.capturing = false; b.mu.Unlock() }
+func (b *Binder) CancelCapture() { b.mu.Lock(); b.capFor = ""; b.mu.Unlock() }
 
 // step handles one poll of what's pressed right now.
 func (b *Binder) step(down map[string]bool) {
 	b.mu.Lock()
-	var captured string
-	if b.capturing {
+	var capAct, captured string
+	if b.capFor != "" {
 		if time.Now().After(b.capUntil) {
-			b.capturing = false
+			b.capFor = ""
 		} else if b.capBase == nil {
 			b.capBase = down // ignore whatever was already held (e.g. the mouse click)
 		} else {
@@ -67,20 +83,42 @@ func (b *Binder) step(down map[string]bool) {
 			}
 			if len(fresh) > 0 {
 				sort.Strings(fresh)
-				captured, b.bind, b.capturing = fresh[0], fresh[0], false
+				capAct, captured = b.capFor, fresh[0]
+				b.binds[capAct] = captured
+				b.capFor = ""
+				b.capBase = map[string]bool{captured: true} // don't fire until it's let go
 			}
 		}
 	}
-	held := b.bind != "" && !b.capturing && captured == "" && down[b.bind]
-	changed := held != b.held
-	b.held = held
+	type chg struct {
+		act  string
+		held bool
+	}
+	var changes []chg
+	for _, act := range []string{actBroadcast, actPTT, actPTM} {
+		id := b.binds[act]
+		held := id != "" && b.capFor == "" && down[id] && !b.capBase[id]
+		if held != b.held[act] {
+			b.held[act] = held
+			changes = append(changes, chg{act, held})
+		}
+	}
+	if b.capFor == "" && len(b.capBase) > 0 {
+		for id := range b.capBase {
+			if !down[id] {
+				delete(b.capBase, id)
+			}
+		}
+	}
 	onC, onCap := b.onChange, b.onCapture
 	b.mu.Unlock()
 	if captured != "" && onCap != nil {
-		onCap(captured)
+		onCap(capAct, captured)
 	}
-	if changed && onC != nil {
-		onC(held)
+	for _, c := range changes {
+		if onC != nil {
+			onC(c.act, c.held)
+		}
 	}
 }
 
@@ -107,6 +145,18 @@ func bindName(id string) string {
 		var dev, btn int
 		if n, _ := sscan2(id, "joy%d:b%d", &dev, &btn); n == 2 {
 			return "Controller " + itoa(dev+1) + " button " + itoa(btn+1)
+		}
+	case strings.HasPrefix(id, "hid:"):
+		parts := strings.Split(id, ":")
+		if len(parts) == 3 {
+			var btn int
+			if n, _ := sscan1(parts[2], "b%d", &btn); n == 1 {
+				dev := hidName(parts[1])
+				if dev == "" {
+					dev = "Controller"
+				}
+				return dev + " button " + itoa(btn)
+			}
 		}
 	case strings.HasPrefix(id, "xkey:"):
 		var kc int

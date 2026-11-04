@@ -22,10 +22,11 @@ type joyInfoEx struct {
 type winInput struct {
 	joyOK   [16]bool
 	recheck int
+	hid     *hidReader
 }
 
 func newInputPoller() *winInput {
-	w := &winInput{}
+	w := &winInput{hid: newHIDReader()}
 	for i := range w.joyOK {
 		w.joyOK[i] = true
 	}
@@ -64,11 +65,12 @@ func (w *winInput) pressed() map[string]bool {
 			}
 		}
 	}
+	w.hid.pressed(down) // every button of every wheel / button box, beyond the 32 above
 	return down
 }
 
 func bindCaption() string {
-	return "Hold it and everyone hears you at full volume, wherever they are on track. Works with any key or a button on your wheel / button box, even while the game is focused."
+	return "Push-to-broadcast: everyone hears you at full volume, wherever they are on track. Keys and wheel / button-box buttons all work while the game is focused."
 }
 
 func x11KeyName(int) string { return "" }

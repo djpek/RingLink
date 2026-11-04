@@ -32,6 +32,7 @@ const (
 	vkAudio24    = 3   // 24 kHz frames (480 samples)
 	legacyFrame  = 320
 	vkPos        = 2
+	vkSettings   = 4  // your "other people's voices" settings, so others can copy them (JSON)
 	jitterTarget = 3  // frames buffered before a talker starts playing (60 ms)
 	jitterMax    = 12 // drop old frames beyond this (240 ms)
 	spkChannels  = 2  // stereo out, so voices can come from the left or right
@@ -77,7 +78,10 @@ type vpeer struct {
 	pos      *vec3
 	game     byte
 	posSeen  time.Time
-	mt       motion // their car's movement, for guessing where it is now
+	mt       motion  // their car's movement, for guessing where it is now
+	userVol  float64 // your volume for this person (1 = 100 %), if userSet
+	userSet  bool
+	shared   *VoiceSettings // their voice settings, if they've sent them
 	talkAt   time.Time
 	gain     float64 // playback goroutine only
 	lp1, lp2 float64
@@ -213,6 +217,9 @@ type Voice struct {
 	Replay   *ReplayVoice // voice in game replays
 	BcastBtn atomic.Bool  // "Broadcast" button switched on in the app
 	BcastKey atomic.Bool  // push-to-broadcast key / wheel button held
+	PTTMode  atomic.Bool  // push to talk instead of voice activated
+	PTTKey   atomic.Bool  // push-to-talk key held
+	PTMKey   atomic.Bool  // push-to-mute key held
 	posKick  chan struct{}
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
@@ -312,6 +319,46 @@ func (v *Voice) RemovePeer(id uint64) {
 	v.mu.Unlock()
 }
 
+// VoiceSettings: the "other people's voices" settings, shared so others can copy them.
+type VoiceSettings struct {
+	Vol      int  `json:"vol"`
+	Range    int  `json:"range"`
+	Muffle   int  `json:"muffle"`
+	BaseMuff int  `json:"baseMuffle"`
+	Dir      bool `json:"directional"`
+	Doppler  int  `json:"doppler"`
+}
+
+func (v *Voice) mySettings() VoiceSettings {
+	return VoiceSettings{int(v.VolPct.Load()), int(v.RangeM.Load()), int(v.Muffle.Load()), int(v.BaseMuff.Load()), v.Direct.Load(), int(v.Doppler.Load())}
+}
+
+// SetPeerVolume: your own volume for one person, in percent (100 = normal).
+func (v *Voice) SetPeerVolume(id uint64, pct int) {
+	v.mu.Lock()
+	p := v.peerLocked(id)
+	p.userVol, p.userSet = float64(pct)/100, true
+	v.mu.Unlock()
+}
+
+// PeerSettings: the voice settings someone shared, if any.
+func (v *Voice) PeerSettings(id uint64) *VoiceSettings {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if p := v.peers[id]; p != nil && p.shared != nil {
+		c := *p.shared
+		return &c
+	}
+	return nil
+}
+
+func (p *vpeer) volMul() float64 {
+	if !p.userSet {
+		return 1
+	}
+	return p.userVol
+}
+
 type PeerVoice struct {
 	Talking bool
 	Dist    float64 // -1 when unknown
@@ -340,7 +387,7 @@ func (v *Voice) Status() VoiceStatus {
 		st.Peers[id] = PeerVoice{
 			Talking: time.Since(p.talkAt) < 400*time.Millisecond,
 			Dist:    d,
-			Volume:  int(math.Round(v.gainFor(d) * 100)),
+			Volume:  int(math.Round(v.gainFor(d) * p.volMul() * 100)),
 			Muffled: int(math.Round(v.muffleFor(d) * 100)),
 			OnTrack: p.pos != nil && time.Since(p.posSeen) < 3*time.Second,
 			Game:    gameName(p.game),
@@ -551,6 +598,7 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 	// the last couple of quiet frames, sent when the gate opens so word starts aren't clipped
 	var pre [][]int16
 	wasTalking := false
+	var pttAt time.Time
 	for {
 		select {
 		case <-stop:
@@ -588,7 +636,18 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 		if rms > thr {
 			v.lastLoud = time.Now()
 		}
-		talking := time.Since(v.lastLoud) < 350*time.Millisecond && !v.Muted.Load()
+		var talking bool
+		if v.PTTMode.Load() {
+			// push to talk: while the key is held (holding broadcast talks too), plus a
+			// short tail so the last word isn't clipped
+			if v.PTTKey.Load() || v.BcastKey.Load() {
+				pttAt = time.Now()
+			}
+			talking = time.Since(pttAt) < 150*time.Millisecond
+		} else {
+			talking = time.Since(v.lastLoud) < 350*time.Millisecond
+		}
+		talking = talking && !v.Muted.Load() && !v.PTMKey.Load()
 		v.talking.Store(talking)
 		if !talking {
 			wasTalking = false
@@ -699,6 +758,13 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 			}
 		}
 		v.mu.Unlock()
+	case vkSettings:
+		var vs VoiceSettings
+		if json.Unmarshal(b[1:], &vs) == nil {
+			v.mu.Lock()
+			v.peerLocked(from).shared = &vs
+			v.mu.Unlock()
+		}
 	case vkPos:
 		v.mu.Lock()
 		p := v.peerLocked(from)
@@ -747,7 +813,7 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 			pan, behind := v.dirLocked(p)
 			m := v.muffleFor(d)
 			m = 1 - (1-m)*(1-0.3*behind) // voices from behind you are a bit duller
-			jobs = append(jobs, mixJob{p, fr, v.gainFor(d), m, pan})
+			jobs = append(jobs, mixJob{p, fr, v.gainFor(d) * p.volMul(), m, pan})
 		}
 		// voices recorded at this moment of the replay you're watching: queued per speaker
 		// (so they play back smoothly) and heard from where their car was, relative to
@@ -890,12 +956,19 @@ func (v *Voice) posLoop(stop chan struct{}) {
 	bng := startBeamNGListener(stop, v.logf)
 	t := time.NewTicker(100 * time.Millisecond) // LMU updates positions every 200 ms: catch each one quickly
 	defer t.Stop()
+	tick := 0
 	for {
 		select {
 		case <-stop:
 			return
 		case <-t.C:
 		case <-v.posKick:
+		}
+		if tick++; tick%30 == 1 { // every 3 s: share your voice settings so others can copy them
+			if send := v.sender(); send != nil {
+				js, _ := json.Marshal(v.mySettings())
+				send(append([]byte{vkSettings}, js...))
+			}
 		}
 		// BeamNG only sends while you're driving, so a recent packet wins;
 		// otherwise ask LMU.

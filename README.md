@@ -11,7 +11,7 @@ Proximity voice chat for **Le Mans Ultimate** and **BeamNG.drive**: the closer s
 ## How to use
 
 1. Open RingLink (`RingLink.exe` on Windows, `ringlink-linux` on Linux).
-2. One person sets **Max people** (2-8) and clicks **Create room**.
+2. One person sets **Max people** (2-40) and clicks **Create room**.
 3. Send the room code (like `K7QM-29XD`) to your friends.
 4. Everyone else pastes the code and clicks **Join room**.
 
@@ -31,6 +31,8 @@ You can set how loud everyone is, how far voices carry, how muffled they get wit
 - **Always muffled:** muffles everyone all the time, like talking through helmets or a team radio.
 - **Doppler effect:** a car closing on you sounds slightly higher, one pulling away slightly lower.
 - **Garage = radio:** while you're in the garage, you hear everyone and everyone hears you at full volume, wherever they are.
+- **Push to talk / push to mute:** choose **Voice activated** or **Push to talk** under *How your mic sends*, and bind push-to-talk and push-to-mute to a key or a wheel / button-box button.
+- **Per-person volume and copying settings:** the ⋮ next to someone in the room opens their own volume slider (remembered by name) and **Copy their voice settings**, which copies their "other people's voices" settings to yours.
 - **Broadcast to everyone:** click **Broadcast to everyone**, or bind **Push-to-broadcast** to a keyboard key or a wheel / button-box button and hold it. Everyone hears you at full volume, centred, until you let go. Works while the game is focused (Windows; Linux on X11, e.g. Linux Mint. On Wayland only wheel buttons work).
 - **Voice in replays (LMU):** while you drive, RingLink saves the talking (yours and what you receive, even people too far away to hear, and even with voice chat off). When you watch that session's replay later, even after restarting the game, the voices play again at the right moments and come from the cars. Slow motion and fast forward (0.2x to 4x) play the voice in step; pausing, rewinding and fast skipping stay quiet. Live voice is heard normally (full volume) while you watch. The last 30 sessions are kept in RingLink's settings folder under `voice-replays`.
 
@@ -48,6 +50,7 @@ Use headphones so nobody hears themselves echo.
 
 - **Rooms:** the room code is the only thing you share. Each member posts a small announcement (name and network address) to a topic on [ntfy.sh](https://ntfy.sh), a free public message relay. The topic name and the encryption key both come from the room code (Argon2id + XChaCha20-Poly1305), so the relay only ever sees ciphertext.
 - **Voice:** everyone connects directly to everyone else with UDP hole punching (STUN to find public addresses). Audio is 24 kHz mono G.711 mu-law in 20 ms frames (older 16 kHz versions are still understood), encrypted with the room key, and mixed to stereo on playback. Nothing goes through a server.
+- **Big rooms:** up to 40 people. Everyone tells the room who they reach directly; when two people can't connect directly (or it's much slower), their voice goes through whoever has the quickest path to both, passed on still encrypted. In rooms over 8, your voice isn't sent to cars more than 600 m away (further than anyone's range setting), which keeps upload low.
 - **Proximity:** each app reads its own car position (LMU REST API or BeamNG MotionSim UDP) and shares it with the room. Distances are only compared between people in the same game. Positions are moved forward along each car's velocity between updates (LMU only updates them 5 times a second), and your direction comes from how your car moves.
 - **Replays:** LMU's session clock (`/rest/watch/sessionInfo`) timestamps the recorded voice; the replay position comes from LMU's `ws://127.0.0.1:6398/websocket/replaymetrics` stream. Recordings are matched to a replay by track and time span.
 - **Audio I/O:** Windows uses winmm (no extra installs). Linux uses `parec`/`pacat`, `pw-record`/`pw-play` or `arecord`/`aplay`, whichever is installed; device lists come from `pactl`.

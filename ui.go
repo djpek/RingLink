@@ -103,6 +103,7 @@ var (
 	icLess    = mustIcon(icons.NavigationExpandLess)
 	icBcast   = mustIcon(icons.ActionRecordVoiceOver)
 	icKey     = mustIcon(icons.HardwareKeyboard)
+	icMore    = mustIcon(icons.NavigationMoreVert)
 )
 
 var gameOptions = []struct {
@@ -127,8 +128,11 @@ type ui struct {
 	sens, vol, rng, muff       widget.Float
 	baseMuff, doppler          widget.Float
 	dirBtn, replayBtn          widget.Clickable
-	bcastBtn, bindBtn, unbind  widget.Clickable
-	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
+	bcastBtn                   widget.Clickable
+	bindBtns, unbindBtns       map[string]*widget.Clickable // per action
+	pttBtn, fxBtn              widget.Clickable
+	mem                        map[uint64]*memUI // per person in the room
+	micLevelKey                byte              // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
 	copiedAt                   time.Time
 	showLog                    bool
@@ -202,6 +206,37 @@ func (u *ui) syncFX() {
 	u.muff.Value = float32(v.Muffle.Load()) / 100
 	u.baseMuff.Value = float32(v.BaseMuff.Load()) / 100
 	u.doppler.Value = float32(v.Doppler.Load()) / 200
+}
+
+// memUI: the ⋮ menu state for one person in the room.
+type memUI struct {
+	more, copy widget.Clickable
+	vol        widget.Float
+	open       bool
+	volInit    bool
+	copiedAt   time.Time
+}
+
+func (u *ui) memFor(id uint64) *memUI {
+	if u.mem == nil {
+		u.mem = map[uint64]*memUI{}
+	}
+	m := u.mem[id]
+	if m == nil {
+		m = &memUI{}
+		u.mem[id] = m
+	}
+	return m
+}
+
+func (u *ui) bindClick(act string) (*widget.Clickable, *widget.Clickable) {
+	if u.bindBtns == nil {
+		u.bindBtns, u.unbindBtns = map[string]*widget.Clickable{}, map[string]*widget.Clickable{}
+	}
+	if u.bindBtns[act] == nil {
+		u.bindBtns[act], u.unbindBtns[act] = new(widget.Clickable), new(widget.Clickable)
+	}
+	return u.bindBtns[act], u.unbindBtns[act]
 }
 
 // ---------- input ----------
@@ -355,20 +390,39 @@ func (u *ui) update(gtx layout.Context) {
 		a.Voice.BcastBtn.Store(!a.Voice.BcastBtn.Load())
 		a.Voice.KickPos()
 	}
-	if u.bindBtn.Clicked(gtx) {
-		if a.Bind.Capturing() {
+	for _, act := range []string{actBroadcast, actPTT, actPTM} {
+		bb, ub := u.bindClick(act)
+		if bb.Clicked(gtx) {
+			if a.Bind.CapturingFor() == act {
+				a.Bind.CancelCapture()
+			} else {
+				a.Bind.Capture(act)
+			}
+		}
+		if ub.Clicked(gtx) {
 			a.Bind.CancelCapture()
-		} else {
-			a.Bind.Capture()
+			a.Bind.SetBind(act, "")
+			switch act {
+			case actBroadcast:
+				a.S.BcastBind = ""
+			case actPTT:
+				a.S.PTTBind = ""
+			case actPTM:
+				a.S.PTMBind = ""
+			}
+			save = true
 		}
 	}
-	if u.unbind.Clicked(gtx) {
-		a.Bind.CancelCapture()
-		a.Bind.SetBind("")
-		a.S.BcastBind = ""
+	if u.pttBtn.Clicked(gtx) {
+		a.S.PushToTalk = !a.S.PushToTalk
+		a.Voice.PTTMode.Store(a.S.PushToTalk)
 		save = true
 	}
-	if a.Bind.Capturing() {
+	if u.fxBtn.Clicked(gtx) {
+		a.S.FXClosed = !a.S.FXClosed
+		save = true
+	}
+	if a.Bind.CapturingFor() != "" {
 		redrawIn(gtx, 10) // until the press arrives
 	}
 	if u.dirBtn.Clicked(gtx) {
@@ -395,6 +449,9 @@ func (u *ui) update(gtx layout.Context) {
 	dragging := false
 	for _, f := range []*widget.Float{&u.sens, &u.vol, &u.rng, &u.muff, &u.baseMuff, &u.doppler, &u.opacityF, &u.panelF} {
 		dragging = dragging || f.Dragging()
+	}
+	for _, m := range u.mem {
+		dragging = dragging || m.vol.Dragging()
 	}
 	if u.wasDragging && !dragging {
 		a.Save()
@@ -1131,37 +1188,159 @@ func (u *ui) memberRow(gtx layout.Context, m MemberInfo, vs VoiceStatus) layout.
 			}
 		}
 	}
-	return layout.Inset{Top: 6, Bottom: 6}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-			layout.Rigid(u.avatar(m.Name, talking)),
-			layout.Rigid(layout.Spacer{Width: 12}.Layout),
-			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				return col(gtx,
-					func(gtx layout.Context) layout.Dimensions {
-						l := material.Label(u.th, 14.5, name)
-						l.Font.Weight = font.Medium
-						return l.Layout(gtx)
-					},
-					vgap(2),
-					u.label(12.5, sub, subC),
-				)
-			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				if m.Self || !m.Connected || !hasPV {
-					return layout.Dimensions{}
-				}
-				return row(gtx, 8,
-					func(gtx layout.Context) layout.Dimensions {
-						sz := gtx.Dp(16)
-						gtx.Constraints = layout.Exact(image.Pt(sz, sz))
-						return icVolume.Layout(gtx, colFaint)
-					},
-					u.barK(m.ID, float32(pv.Volume)/100, colAccent, 60),
-					u.label(12, fmt.Sprintf("%d%%", pv.Volume), colMuted),
-				)
-			}),
+	mu := u.memFor(m.ID)
+	if !m.Self && mu.more.Clicked(gtx) {
+		mu.open = !mu.open
+	}
+	u.memberMenuEvents(gtx, m, mu)
+	rowW := func(gtx layout.Context) layout.Dimensions {
+		return layout.Inset{Top: 6, Bottom: 6}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Rigid(u.avatar(m.Name, talking)),
+				layout.Rigid(layout.Spacer{Width: 12}.Layout),
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					return col(gtx,
+						func(gtx layout.Context) layout.Dimensions {
+							l := material.Label(u.th, 14.5, name)
+							l.Font.Weight = font.Medium
+							return l.Layout(gtx)
+						},
+						vgap(2),
+						u.label(12.5, sub, subC),
+					)
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if m.Self || !m.Connected || !hasPV {
+						return layout.Dimensions{}
+					}
+					return row(gtx, 8,
+						func(gtx layout.Context) layout.Dimensions {
+							sz := gtx.Dp(16)
+							gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+							return icVolume.Layout(gtx, colFaint)
+						},
+						u.barK(m.ID, float32(pv.Volume)/100, colAccent, 60),
+						u.label(12, fmt.Sprintf("%d%%", pv.Volume), colMuted),
+					)
+				}),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					if m.Self {
+						return layout.Dimensions{}
+					}
+					return layout.Inset{Left: 4}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return material.Clickable(gtx, &mu.more, func(gtx layout.Context) layout.Dimensions {
+							pointer.CursorPointer.Add(gtx.Ops)
+							return layout.UniformInset(4).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+								sz := gtx.Dp(20)
+								gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+								c := colMuted
+								if mu.open {
+									c = colAccent
+								}
+								return icMore.Layout(gtx, c)
+							})
+						})
+					})
+				}),
+			)
+		})
+	}
+	if m.Self || !mu.open {
+		return rowW(gtx)
+	}
+	return col(gtx, rowW, u.memberMenu(m, mu))
+}
+
+// memberMenuEvents: the per-person volume slider and "copy their settings".
+func (u *ui) memberMenuEvents(gtx layout.Context, m MemberInfo, mu *memUI) {
+	a := u.app
+	if !mu.volInit {
+		pct := 100
+		if v, ok := a.S.PeerVol[m.Name]; ok {
+			pct = v
+		}
+		mu.vol.Value, mu.volInit = float32(pct)/200, true
+	}
+	if mu.vol.Update(gtx) {
+		pct := int(mu.vol.Value*200+0.5) / 5 * 5
+		a.Voice.SetPeerVolume(m.ID, pct)
+		if a.S.PeerVol == nil {
+			a.S.PeerVol = map[string]int{}
+		}
+		a.S.PeerVol[m.Name] = pct
+	}
+	if mu.copy.Clicked(gtx) {
+		if vs := a.Voice.PeerSettings(m.ID); vs != nil {
+			v := a.Voice
+			v.VolPct.Store(int32(vs.Vol))
+			v.RangeM.Store(int32(vs.Range))
+			v.Muffle.Store(int32(vs.Muffle))
+			v.BaseMuff.Store(int32(vs.BaseMuff))
+			v.Direct.Store(vs.Dir)
+			v.Doppler.Store(int32(vs.Doppler))
+			vol, rng, muf, base, dir, dop := vs.Vol, vs.Range, vs.Muffle, vs.BaseMuff, vs.Dir, vs.Doppler
+			a.S.VoiceVol, a.S.VoiceRange, a.S.VoiceMuff, a.S.VoiceBase, a.S.VoiceDir, a.S.VoiceDop = &vol, &rng, &muf, &base, &dir, &dop
+			u.syncFX()
+			a.Save()
+			mu.copiedAt = time.Now()
+			a.Log("Copied %s's voice settings.", m.Name)
+		}
+	}
+}
+
+func (u *ui) memberMenu(m MemberInfo, mu *memUI) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		pct := int(mu.vol.Value*200+0.5) / 5 * 5
+		vs := u.app.Voice.PeerSettings(m.ID)
+		var ws []layout.Widget
+		ws = append(ws,
+			u.sliderRow("Volume for "+m.Name, fmt.Sprintf("%d%%", pct), &mu.vol),
+			u.caption("Only changes how loud they are for you. Remembered by name."),
+			vgap(10),
 		)
-	})
+		if vs == nil {
+			ws = append(ws, u.caption("Their voice settings show up here once they're on this version of RingLink with voice on."))
+		} else {
+			dir := "off"
+			if vs.Dir {
+				dir = "on"
+			}
+			lbl := "Copy their voice settings"
+			if time.Since(mu.copiedAt) < 2*time.Second {
+				lbl = "Copied"
+			}
+			ws = append(ws,
+				u.button(&mu.copy, icCopy, lbl, btnSecondary, true),
+				vgap(4),
+				u.caption(fmt.Sprintf("Volume %d%% · carry %d m · muffle %d%% · always muffled %d%% · directional %s · Doppler %d%%",
+					vs.Vol, vs.Range, vs.Muffle, vs.BaseMuff, dir, vs.Doppler)),
+			)
+		}
+		return layout.Inset{Left: 48, Bottom: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return col(gtx, ws...)
+		})
+	}
+}
+
+func (u *ui) bindRow(act, label string) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		bb, ub := u.bindClick(act)
+		cur := u.app.Bind.Bind(act)
+		name := bindName(cur)
+		kind := btnGhost
+		if u.app.Bind.CapturingFor() == act {
+			name, kind = "Press a key or wheel button…", btnPrimary
+		}
+		ws := []layout.FlexChild{
+			layout.Flexed(1, u.label(13.5, label, colText)),
+			layout.Rigid(u.button(bb, icKey, name, kind, false)),
+		}
+		if cur != "" {
+			ws = append(ws, layout.Rigid(layout.Spacer{Width: 6}.Layout),
+				layout.Rigid(u.button(ub, icRemove, "Clear", btnGhost, false)))
+		}
+		return layout.Flex{Alignment: layout.Middle}.Layout(gtx, ws...)
+	}
 }
 
 func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
@@ -1219,22 +1398,28 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 					}
 					return u.button(&u.bcastBtn, icBcast, lbl, kind, true)(gtx)
 				},
-				vgap(8),
+				vgap(12),
 				func(gtx layout.Context) layout.Dimensions {
-					name := bindName(u.app.Bind.Bind())
-					if u.app.Bind.Capturing() {
-						name = "Press a key or wheel button…"
+					lbl, kind := "Voice activated", btnGhost
+					if u.app.S.PushToTalk {
+						lbl, kind = "Push to talk", btnPrimary
 					}
-					ws := []layout.FlexChild{
-						layout.Flexed(1, u.label(13.5, "Push-to-broadcast", colText)),
-						layout.Rigid(u.button(&u.bindBtn, icKey, name, btnGhost, false)),
-					}
-					if u.app.Bind.Bind() != "" {
-						ws = append(ws, layout.Rigid(layout.Spacer{Width: 6}.Layout),
-							layout.Rigid(u.button(&u.unbind, icRemove, "Clear", btnGhost, false)))
-					}
-					return layout.Flex{Alignment: layout.Middle}.Layout(gtx, ws...)
+					return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+						layout.Flexed(1, u.label(13.5, "How your mic sends", colText)),
+						layout.Rigid(u.button(&u.pttBtn, icMic, lbl, kind, false)),
+					)
 				},
+				u.caption(map[bool]string{false: "Sends whenever you speak (set how sensitive below). Tap to switch to push to talk.",
+					true: "Only sends while you hold your push-to-talk button (holding push-to-broadcast talks too). Tap to switch back."}[u.app.S.PushToTalk]),
+				vgap(8),
+			)
+			if u.app.S.PushToTalk {
+				ws = append(ws, u.bindRow(actPTT, "Push-to-talk"), vgap(4))
+			}
+			ws = append(ws,
+				u.bindRow(actPTM, "Push-to-mute"),
+				vgap(4),
+				u.bindRow(actBroadcast, "Push-to-broadcast"),
 				u.caption(bindCaption()),
 				vgap(14),
 			)
@@ -1244,6 +1429,10 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 			status := "Quiet"
 			if muted {
 				lvlC, status = colWarn, "Muted"
+			} else if v.PTMKey.Load() {
+				lvlC, status = colWarn, "Muted (holding push-to-mute)"
+			} else if !vs.Talking && u.app.S.PushToTalk {
+				status = "Hold push-to-talk"
 			} else if vs.Talking && v.Broadcasting() {
 				lvlC, status = colGood, "Broadcasting"
 			} else if vs.Talking {
@@ -1267,11 +1456,42 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 		}
 		ws = append(ws,
 			func(gtx layout.Context) layout.Dimensions {
+				ic := icLess
+				if u.app.S.FXClosed {
+					ic = icExpand
+				}
 				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-					layout.Flexed(1, u.sectionLabel("Other people's voices")),
-					layout.Rigid(u.button(&u.resetFX, icRestore, "Reset", btnGhost, false)),
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						return material.Clickable(gtx, &u.fxBtn, func(gtx layout.Context) layout.Dimensions {
+							pointer.CursorPointer.Add(gtx.Ops)
+							return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+								layout.Rigid(u.sectionLabel("Other people's voices")),
+								layout.Rigid(layout.Spacer{Width: 6}.Layout),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									sz := gtx.Dp(18)
+									gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+									return ic.Layout(gtx, colMuted)
+								}),
+								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+									return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, gtx.Dp(20))}
+								}),
+							)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						if u.app.S.FXClosed {
+							return layout.Dimensions{}
+						}
+						return u.button(&u.resetFX, icRestore, "Reset", btnGhost, false)(gtx)
+					}),
 				)
 			},
+		)
+		if u.app.S.FXClosed {
+			ws = append(ws, vgap(10), u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."))
+			return col(gtx, ws...)
+		}
+		ws = append(ws,
 			u.sliderRow("Volume", fmt.Sprintf("%d%%", v.VolPct.Load()), &u.vol),
 			vgap(6),
 			u.sliderRow("How far voices carry", fmt.Sprintf("%d m", v.RangeM.Load()), &u.rng),
