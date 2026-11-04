@@ -118,3 +118,55 @@ func TestVoiceMix(t *testing.T) {
 		t.Fatalf("status %+v", st.Peers)
 	}
 }
+
+// Low quality for far-away people: a 300 Hz tone survives the trip (still recognisable),
+// three frames come back per packet, and a packet is about a fifth of the full-quality bytes.
+func TestLowQualityVoice(t *testing.T) {
+	var e lowEncoder
+	var pkts [][]byte
+	ph := 0.0
+	var in []int16
+	for f := 0; f < 9; f++ {
+		fr := make([]int16, voiceFrame)
+		for i := range fr {
+			fr[i] = int16(8000 * math.Sin(ph))
+			ph += 2 * math.Pi * 300 / voiceRate
+		}
+		in = append(in, fr...)
+		if p := e.add(fr); p != nil {
+			pkts = append(pkts, p)
+		}
+	}
+	if len(pkts) != 3 {
+		t.Fatalf("%d packets for 9 frames", len(pkts))
+	}
+	var out []int16
+	for _, p := range pkts {
+		frs := decodeLow(p)
+		if len(frs) != 3 {
+			t.Fatal("bad decode")
+		}
+		for _, f := range frs {
+			out = append(out, f...)
+		}
+	}
+	// compare after the filters settle, allowing for the low-pass delay
+	best := 0.0
+	for lag := 0; lag < 20; lag++ {
+		var num, den float64
+		for i := 2000; i < len(in)-lag; i++ {
+			num += float64(in[i]) * float64(out[i+lag])
+			den += float64(in[i]) * float64(in[i])
+		}
+		best = math.Max(best, num/den)
+	}
+	if best < 0.8 {
+		t.Fatalf("tone came back too different: correlation %.2f", best)
+	}
+	full := 3 * (3 + voiceFrame + 80) // 3 full packets incl. ~80 bytes overhead each
+	low := lowPktBytes + 80
+	if float64(low)/float64(full) > 0.25 {
+		t.Fatalf("low quality uses %d bytes vs %d", low, full)
+	}
+	t.Logf("low quality: %d bytes per 60 ms vs %d (%.0f%%)", low, full, 100*float64(low)/float64(full))
+}

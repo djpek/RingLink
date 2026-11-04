@@ -81,6 +81,8 @@ type vpeer struct {
 	mt       motion  // their car's movement, for guessing where it is now
 	userVol  float64 // your volume for this person (1 = 100 %), if userSet
 	userSet  bool
+	fullAt   time.Time      // last full-quality voice packet from them
+	lowAt    time.Time      // last low-quality one (arrives 60 ms at a time: buffer a bit more)
 	shared   *VoiceSettings // their voice settings, if they've sent them
 	talkAt   time.Time
 	gain     float64 // playback goroutine only
@@ -103,7 +105,11 @@ const soundSpeed = 343.0
 // (r > 1 = higher pitch, consumes audio a little faster), or nil when they're silent.
 func (p *vpeer) nextFrameLocked(r float64) []int16 {
 	// at fast replay speeds each output frame eats several input frames, so buffer more
-	if p.priming && len(p.queue) >= jitterTarget+int(r)-1 {
+	extra := 0
+	if time.Since(p.lowAt) < time.Second {
+		extra = lowFrames - 1
+	}
+	if p.priming && len(p.queue) >= jitterTarget+int(r)-1+extra {
 		p.priming = false
 	}
 	if p.priming {
@@ -184,9 +190,10 @@ func (p *vpeer) dopplerRateLocked(d float64, now time.Time, amount float64) floa
 }
 
 type Voice struct {
-	send   func([]byte) // sends a voice payload to everyone in the room
-	logf   func(string, ...any)
-	notify func()
+	send     func([]byte) // sends a voice payload to everyone in the room
+	sendLowF func([]byte) // low-quality voice for far-away people
+	logf     func(string, ...any)
+	notify   func()
 
 	mu        sync.Mutex
 	running   bool
@@ -284,6 +291,23 @@ func (v *Voice) TooFar(id uint64) bool {
 		return false
 	}
 	return v.distLocked(p) > cullDist
+}
+
+// SetLowSender: where low-quality packets go (the app sends them only to far-away
+// people in big rooms; nil = nowhere).
+func (v *Voice) SetLowSender(f func([]byte)) {
+	v.mu.Lock()
+	v.sendLowF = f
+	v.mu.Unlock()
+}
+
+func (v *Voice) sendLow(p []byte) {
+	v.mu.Lock()
+	f := v.sendLowF
+	v.mu.Unlock()
+	if f != nil {
+		f(p)
+	}
 }
 
 func (v *Voice) sender() func([]byte) {
@@ -597,6 +621,7 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 	noise := 200.0 // running noise-floor estimate (RMS)
 	// the last couple of quiet frames, sent when the gate opens so word starts aren't clipped
 	var pre [][]int16
+	var lowEnc lowEncoder // the same voice in low quality, for people far away in big rooms
 	wasTalking := false
 	var pttAt time.Time
 	for {
@@ -650,6 +675,11 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 		talking = talking && !v.Muted.Load() && !v.PTMKey.Load()
 		v.talking.Store(talking)
 		if !talking {
+			if wasTalking { // stopped talking: send the rest of the low-quality packet
+				if low := lowEnc.flush(); low != nil {
+					v.sendLow(low)
+				}
+			}
 			wasTalking = false
 			pre = append(pre, append([]int16(nil), frame...))
 			if len(pre) > 2 {
@@ -675,6 +705,9 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 				pkt[3+i] = linearToULaw(s)
 			}
 			send(pkt)
+			if low := lowEnc.add(fr); low != nil {
+				v.sendLow(low)
+			}
 			if v.Replay.Enabled() {
 				v.mu.Lock()
 				mp := v.myPos
@@ -696,35 +729,9 @@ func (v *Voice) peerLocked(id uint64) *vpeer {
 	return p
 }
 
-// OnPacket handles a voice payload from someone in the room.
-func (v *Voice) OnPacket(from uint64, b []byte) {
-	if len(b) < 1 {
-		return
-	}
-	switch b[0] {
-	case vkAudio, vkAudio24:
-		var fr []int16
-		switch {
-		case b[0] == vkAudio24 && len(b) == 3+voiceFrame:
-			fr = make([]int16, voiceFrame)
-			for i := range fr {
-				fr[i] = uLawToLinear(b[3+i])
-			}
-		case b[0] == vkAudio && len(b) == 3+legacyFrame: // older RingLink: 16 kHz, upsample x1.5
-			src := make([]float64, legacyFrame+1)
-			for i := 0; i < legacyFrame; i++ {
-				src[i] = float64(uLawToLinear(b[3+i]))
-			}
-			src[legacyFrame] = src[legacyFrame-1]
-			fr = make([]int16, voiceFrame)
-			for i := range fr {
-				t := float64(i) * legacyFrame / voiceFrame
-				k := int(t)
-				fr[i] = int16(src[k] + (src[k+1]-src[k])*(t-float64(k)))
-			}
-		default:
-			return
-		}
+// onFrames: decoded 20 ms frames from someone: play them and save them for replays.
+func (v *Voice) onFrames(from uint64, frs [][]int16) {
+	for _, fr := range frs {
 		loud := false
 		for _, x := range fr {
 			if x > 2000 || x < -2000 {
@@ -758,6 +765,52 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 			}
 		}
 		v.mu.Unlock()
+	}
+}
+
+// OnPacket handles a voice payload from someone in the room.
+func (v *Voice) OnPacket(from uint64, b []byte) {
+	if len(b) < 1 {
+		return
+	}
+	switch b[0] {
+	case vkAudio, vkAudio24:
+		var fr []int16
+		switch {
+		case b[0] == vkAudio24 && len(b) == 3+voiceFrame:
+			fr = make([]int16, voiceFrame)
+			for i := range fr {
+				fr[i] = uLawToLinear(b[3+i])
+			}
+		case b[0] == vkAudio && len(b) == 3+legacyFrame: // older RingLink: 16 kHz, upsample x1.5
+			src := make([]float64, legacyFrame+1)
+			for i := 0; i < legacyFrame; i++ {
+				src[i] = float64(uLawToLinear(b[3+i]))
+			}
+			src[legacyFrame] = src[legacyFrame-1]
+			fr = make([]int16, voiceFrame)
+			for i := range fr {
+				t := float64(i) * legacyFrame / voiceFrame
+				k := int(t)
+				fr[i] = int16(src[k] + (src[k+1]-src[k])*(t-float64(k)))
+			}
+		default:
+			return
+		}
+		v.mu.Lock()
+		v.peerLocked(from).fullAt = time.Now()
+		v.mu.Unlock()
+		v.onFrames(from, [][]int16{fr})
+	case vkLow: // low-quality voice: they're far away in a big room
+		v.mu.Lock()
+		dup := time.Since(v.peerLocked(from).fullAt) < 100*time.Millisecond // switching from full quality: no repeats
+		v.mu.Unlock()
+		if frs := decodeLow(b); frs != nil && !dup {
+			v.mu.Lock()
+			v.peerLocked(from).lowAt = time.Now()
+			v.mu.Unlock()
+			v.onFrames(from, frs)
+		}
 	case vkSettings:
 		var vs VoiceSettings
 		if json.Unmarshal(b[1:], &vs) == nil {

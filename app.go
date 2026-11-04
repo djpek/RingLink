@@ -252,6 +252,14 @@ func (a *App) open(code string, creator bool) error {
 		}
 		r.SendVoiceSkip(p, a.Voice.TooFar)
 	})
+	// far-away people in big rooms still get your voice, in low quality (about a fifth
+	// of the upload), so they can hear it in their replays
+	a.Voice.SetLowSender(func(p []byte) {
+		if r.Size() <= cullRoomAbove {
+			return // small rooms: everyone already gets full quality
+		}
+		r.SendVoiceSkip(p, func(id uint64) bool { return !a.Voice.TooFar(id) })
+	})
 	if creator {
 		a.Log("Room %s created (up to %d people). Send the code to your friends.", r.Code, a.S.MaxPeople)
 	} else {
