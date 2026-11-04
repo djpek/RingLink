@@ -2001,14 +2001,17 @@ func (u *ui) devicePicker(sel *widget.Clickable, ic *widget.Icon, title, current
 type dropState struct {
 	open bool
 	at   time.Time
-	seen bool
+	from float32 // belt position when it last changed direction
+	dur  float64 // seconds for a full trip
 }
 
-// dropdown draws a field and, when open, the rows under it. The rows wait in a line
-// inside the button, invisible. One after another each one launches: it lifts up
-// toward you off the page (blurred, a little bigger) and pulls down into its place,
-// sharp once it lands. Closing sends them back in reverse order.
+// dropdown draws a field and, when open, the rows under it. Opening works like a
+// conveyor belt: the rows feed out of the button together (the bottom of the list
+// comes out first and leads the way down) and are only revealed as they pass the
+// button's bottom edge, fading in. They blur with speed (most mid-way) and are sharp
+// when the belt stops. Closing pulls the belt back up into the button.
 func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Widget, items []layout.Widget, perRow bool) layout.Dimensions {
+	_ = perRow
 	if u.drops == nil {
 		u.drops = map[string]*dropState{}
 	}
@@ -2018,37 +2021,15 @@ func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Wi
 		u.drops[key] = ds
 	}
 	if ds.open != open {
+		// reversing mid-way: carry on from where the belt is
+		cur := ds.prog(gtx.Now)
 		ds.open, ds.at = open, gtx.Now
-	}
-	n := len(items)
-	const flight = 0.22 // seconds for one block's trip
-	// the next block launches when the one before is halfway down
-	stagger := flight * 0.45
-	blocks := 0
-	if u.dropBlocks != nil {
-		blocks = u.dropBlocks[key]
-	}
-	total := flight + stagger*float64(max(0, blocks-1))
-	el := gtx.Now.Sub(ds.at).Seconds()
-	if el < total {
-		redrawIn(gtx, 60)
-	}
-	// row i's progress: 0 = in the button, 1 = in place
-	prog := func(i int) float32 {
-		k := i
-		if !open {
-			k = n - 1 - i // last block leaves first
-		}
-		t := float32(math.Min(1, math.Max(0, (el-stagger*float64(k))/flight)))
-		if !open {
-			t = 1 - t
-		}
-		return t
+		ds.from = cur
 	}
 	fm := op.Record(gtx.Ops)
 	fd := field(gtx)
 	fieldCall := fm.Stop()
-	if n == 0 || !open && el >= total {
+	if len(items) == 0 {
 		fieldCall.Add(gtx.Ops)
 		return fd
 	}
@@ -2060,96 +2041,80 @@ func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Wi
 		size image.Point
 		y    int
 	}
-	// rows travel in blocks: everything up to the next small gap goes together
-	// (e.g. a slider with its label and caption)
 	var recs []rec
-	y, gy := 0, 0
-	m := op.Record(cgtx.Ops)
-	for i, it := range items {
-		st := op.Offset(image.Pt(0, y-gy)).Push(cgtx.Ops)
+	y := 0
+	for _, it := range items {
+		m := op.Record(cgtx.Ops)
 		d := it(cgtx)
-		st.Pop()
+		recs = append(recs, rec{m.Stop(), d.Size, y})
 		y += d.Size.Y
-		if perRow || d.Size.Y <= gtx.Dp(12) || i == len(items)-1 {
-			recs = append(recs, rec{m.Stop(), image.Pt(cgtx.Constraints.Max.X, y-gy), gy})
-			gy = y
-			if i < len(items)-1 {
-				m = op.Record(cgtx.Ops)
-			}
-		}
 	}
-	n = len(recs)
-	if u.dropBlocks == nil {
-		u.dropBlocks = map[string]int{}
+	full := y + gap
+	// a longer list takes a little longer to feed out
+	ds.dur = math.Min(0.75, 0.32+float64(full)/float64(gtx.Dp(1600)))
+	p := ds.prog(gtx.Now)
+	if p != 0 && p != 1 {
+		redrawIn(gtx, 60)
 	}
-	u.dropBlocks[key] = n
+	if p <= 0 {
+		fieldCall.Add(gtx.Ops)
+		return fd
+	}
+	e := p * p * (3 - 2*p)              // the belt speeds up, then slows to a stop
+	speed := 6 * p * (1 - p) / 1.5      // 0..1, most mid-way
+	dy := int(-float32(full) * (1 - e)) // the whole list moves together
+	shown := int(float32(full) * e)
 	top := fd.Size.Y + gap
-	// room taken so far: grows as rows land
-	shown := 0
-	for i, r := range recs {
-		t := prog(i)
-		e := t * t * (3 - 2*t)
-		if e > 0 {
-			shown = max(shown, r.y+int(float32(r.size.Y)*e))
+	edge := fd.Size.Y
+	fadeLen := float32(gtx.Dp(36))
+	// only what has come out past the button's bottom edge shows; the button hides the rest
+	cl := clip.Rect{Min: image.Pt(-gtx.Dp(8), edge), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(8), top+shown+gtx.Dp(8))}.Push(gtx.Ops)
+	b := int(speed*float32(gtx.Dp(3)) + 0.5)
+	for _, r := range recs {
+		ry := top + r.y + dy
+		if ry+r.size.Y <= edge {
+			continue // still inside the button
 		}
-	}
-	draw := func(i int) {
-		r := recs[i]
-		t := prog(i)
-		if t <= 0 {
-			return // still in line inside the button: invisible
-		}
-		e := t * t * (3 - 2*t)                                 // quickest mid-flight
-		lift := float32(math.Sin(math.Pi * float64(e)))        // how far off the page
-		startY := float32(-top - r.y + (fd.Size.Y-r.size.Y)/2) // centred in the button
-		dy := int(startY * (1 - e))
-		sc := 0.9 + 0.1*e + 0.08*lift
-		// still fading in as it comes out of the button, fully there partway down
-		a := min(1, t/0.55)
+		// fades in as it comes out of the edge
+		a := min(1, max(0, float32(ry+r.size.Y/2-edge)/fadeLen))
 		alpha := a * a * (3 - 2*a)
-		// blurry behind the button and coming out, sharp as it lands
-		blurAmt := max(lift, float32(math.Pow(float64(1-e), 0.6)))
-		st := op.Offset(image.Pt(0, top+r.y+dy)).Push(gtx.Ops)
-		aff := op.Affine(scaleAbout(r.size, sc)).Push(gtx.Ops)
-		if b := int(blurAmt*float32(gtx.Dp(3)) + 0.5); b < 1 {
+		st := op.Offset(image.Pt(0, ry)).Push(gtx.Ops)
+		if b < 1 {
 			o := paint.PushOpacity(gtx.Ops, alpha)
 			r.call.Add(gtx.Ops)
 			o.Pop()
 		} else {
-			// soft blur while it's up off the page: drawn a few times, slightly spread
-			for k, off := range []image.Point{{0, 0}, {-b, 0}, {b, 0}, {0, -b}, {0, b}} {
-				w := float32(0.2)
+			// motion blur: spread along the direction it's moving (down)
+			for k, off := range []int{0, -b, b, -2 * b} {
+				w := float32(0.22)
 				if k == 0 {
 					w = 0.4
 				}
-				o := paint.PushOpacity(gtx.Ops, alpha*w)
-				oo := op.Offset(off).Push(gtx.Ops)
+				o := paint.PushOpacity(gtx.Ops, alpha*w*1.05)
+				oo := op.Offset(image.Pt(0, off)).Push(gtx.Ops)
 				r.call.Add(gtx.Ops)
 				oo.Pop()
 				o.Pop()
 			}
 		}
-		aff.Pop()
 		st.Pop()
-	}
-	// blocks start under the button and the button hides them completely (nothing
-	// shows through it): they're only revealed as they come out of its bottom edge,
-	// still fading in and blurred
-	cl := clip.Rect{Min: image.Pt(-gtx.Dp(8), fd.Size.Y), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(8), top+shown+gtx.Dp(8))}.Push(gtx.Ops)
-	// landed blocks first, blocks in the air on top of them, the button over everything
-	for i := range recs {
-		if prog(i) >= 1 {
-			draw(i)
-		}
-	}
-	for i := range recs {
-		if t := prog(i); t > 0 && t < 1 {
-			draw(i)
-		}
 	}
 	cl.Pop()
 	fieldCall.Add(gtx.Ops)
-	return layout.Dimensions{Size: image.Pt(fd.Size.X, fd.Size.Y+gap*min(1, shown)+shown)}
+	return layout.Dimensions{Size: image.Pt(fd.Size.X, fd.Size.Y+shown)}
+}
+
+// prog: how far out the belt is (0 = all inside the button, 1 = fully out).
+func (d *dropState) prog(now time.Time) float32 {
+	if d.dur == 0 {
+		d.dur = 0.4
+	}
+	t := float32(now.Sub(d.at).Seconds() / d.dur)
+	t = min(1, max(0, t))
+	if d.open {
+		return d.from + (1-d.from)*t
+	}
+	return d.from * (1 - t)
 }
 
 // shortDevice makes a raw sound-server name a bit friendlier.
