@@ -329,6 +329,23 @@ func (v *Voice) SetSub(name string) {
 
 func (v *Voice) Sub() string { v.mu.Lock(); defer v.mu.Unlock(); return v.mySub }
 
+// PeopleSubs: sub-rooms people in the room are in right now (anyone can make one by
+// joining it), so they show up for everyone to pick.
+func (v *Voice) PeopleSubs() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var out []string
+	if v.mySub != "" {
+		out = append(out, v.mySub)
+	}
+	for _, p := range v.peers {
+		if p.sub != "" && time.Since(p.presAt) < 3*time.Second {
+			out = append(out, p.sub)
+		}
+	}
+	return out
+}
+
 // PeerPresence: whether someone is in the garage and which sub-room they picked.
 func (v *Voice) PeerPresence(id uint64) (inGarage bool, sub string, ok bool) {
 	v.mu.Lock()

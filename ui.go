@@ -1199,10 +1199,12 @@ func (u *ui) isolateBanner(r *Room, rules RoomRules, members []MemberInfo) layou
 func (u *ui) pitsSection(r *Room, rules RoomRules) []layout.Widget {
 	a := u.app
 	mod := r.CanModerate()
-	if !mod && len(rules.Subs) == 0 {
-		return nil
-	}
 	ws := []layout.Widget{divider, u.sectionLabel("Pits")}
+	// sub-rooms: the host / mods' permanent ones plus any someone made by joining it
+	subs := cleanSubs(append(append([]string(nil), rules.Subs...), u.app.Voice.PeopleSubs()...))
+	isPerm := func(n string) bool {
+		return slices.ContainsFunc(rules.Subs, func(x string) bool { return strings.EqualFold(x, n) })
+	}
 	if mod {
 		ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 			if u.pitBtn.Clicked(gtx) {
@@ -1223,9 +1225,9 @@ func (u *ui) pitsSection(r *Room, rules RoomRules) []layout.Widget {
 		}, u.caption(map[bool]string{true: "In the garage everyone hears each other at full volume (or just their sub-room). Changes it for the whole room.",
 			false: "The garage is like anywhere else: you hear people by distance. Changes it for the whole room."}[rules.PitRadio]), vgap(10))
 	}
-	if len(rules.Subs) > 0 {
+	if len(subs) > 0 {
 		cur := a.Voice.Sub()
-		opts := append([]string{""}, rules.Subs...)
+		opts := append([]string{""}, subs...)
 		ws = append(ws, u.label(13.5, "Your sub-room", colText), vgap(6))
 		for i := 0; i < len(opts); i += 3 {
 			rowOpts := opts[i:min(i+3, len(opts))]
@@ -1256,16 +1258,24 @@ func (u *ui) pitsSection(r *Room, rules RoomRules) []layout.Widget {
 			}, vgap(8))
 		}
 		ws = append(ws, u.caption("In the garage (with pit radio on) you only hear and talk to your sub-room. On track you hear everyone as usual."))
+	} else {
+		ws = append(ws, u.caption("Make a sub-room (like a team) to talk only among yourselves in the garage. On track you hear everyone as usual."))
 	}
-	if mod {
+	{
 		ws = append(ws, vgap(10), func(gtx layout.Context) layout.Dimensions {
 			if u.addSub.Clicked(gtx) || submitted(gtx, &u.subEd) {
 				if name := strings.TrimSpace(u.subEd.Text()); name != "" {
-					nr := r.Rules()
-					nr.Subs = append(nr.Subs, name)
-					if err := r.SetRules(nr); err != nil {
-						a.Log("%v", err)
+					if len(name) > 24 {
+						name = name[:24]
 					}
+					if mod && !isPerm(name) { // host / mods: it stays until they remove it
+						nr := r.Rules()
+						nr.Subs = append(nr.Subs, name)
+						if err := r.SetRules(nr); err != nil {
+							a.Log("%v", err)
+						}
+					}
+					a.Voice.SetSub(name) // making a sub-room puts you in it
 					u.subEd.SetText("")
 				}
 			}
@@ -1275,6 +1285,8 @@ func (u *ui) pitsSection(r *Room, rules RoomRules) []layout.Widget {
 				layout.Rigid(u.button(&u.addSub, icAdd, "Add", btnSecondary, false)),
 			)
 		})
+	}
+	if mod {
 		for _, sname := range rules.Subs {
 			sname := sname
 			ws = append(ws, vgap(4), func(gtx layout.Context) layout.Dimensions {

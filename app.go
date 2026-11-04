@@ -39,14 +39,15 @@ type Settings struct {
 }
 
 type App struct {
-	mu     sync.Mutex
-	S      Settings
-	room   *Room
-	logs   []string
-	notify func()
-	Voice  *Voice
-	Bind   *Binder
-	sig    func(topic string) Signaler // tests swap the relay
+	mu       sync.Mutex
+	S        Settings
+	room     *Room
+	logs     []string
+	notify   func()
+	Voice    *Voice
+	Bind     *Binder
+	lastSubs []string                    // the room's permanent sub-rooms last time we looked
+	sig      func(topic string) Signaler // tests swap the relay
 }
 
 func NewApp(notify func()) *App {
@@ -233,9 +234,12 @@ func (a *App) open(code string, creator bool) error {
 		}
 		rules := r.Rules()
 		a.Voice.SetRules(rules.PitRadio, rules.Isolate, r.ID)
-		if sub := a.Voice.Sub(); sub != "" && !slices.ContainsFunc(rules.Subs, func(s string) bool { return strings.EqualFold(s, sub) }) {
-			a.Voice.SetSub("") // that sub-room was removed
+		// a host / mod removed the (permanent) sub-room you're in: leave it
+		if sub := a.Voice.Sub(); sub != "" && slices.ContainsFunc(a.lastSubs, func(s string) bool { return strings.EqualFold(s, sub) }) &&
+			!slices.ContainsFunc(rules.Subs, func(s string) bool { return strings.EqualFold(s, sub) }) {
+			a.Voice.SetSub("")
 		}
+		a.lastSubs = rules.Subs
 		if m := r.MutedByHost(r.ID); m != a.Voice.HostMute.Load() {
 			a.Voice.HostMute.Store(m)
 			if m {
