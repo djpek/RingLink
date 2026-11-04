@@ -29,13 +29,16 @@ import (
 const (
 	codeAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ" // Crockford base32: no I, L, O, U
 	codeLen      = 8
-	MaxRoomSize  = 8
+	MaxRoomSize  = 40
 
-	pkPunch = 1
-	pkPing  = 2
-	pkPong  = 3
-	pkVoice = 4
-	pkBye   = 5
+	pkPunch   = 1
+	pkPing    = 2
+	pkPong    = 3
+	pkVoice   = 4
+	pkBye     = 5
+	pkLinks   = 6 // who I can reach directly and how fast: [id u64, rtt ms u16]...
+	pkRelay   = 7 // please pass this on: [target id u64][sealed packet from me]
+	pkRelayed = 8 // passed on for someone: [sealed packet from them]
 
 	announceEvery = 4 * time.Minute
 	announceFresh = 6 * time.Minute // older announces are ignored when joining
@@ -118,6 +121,11 @@ type peer struct {
 	joined   int64
 	rtt      time.Duration
 	gone     bool
+
+	links     map[uint64]time.Duration // who they reach directly (from their pkLinks)
+	linksAt   time.Time
+	lastRelay time.Time // last packet from them that came through someone else
+	via       uint64    // relay we last used to reach them (0 = direct)
 }
 
 type MemberInfo struct {
@@ -126,6 +134,7 @@ type MemberInfo struct {
 	Self      bool
 	Connected bool
 	RTT       time.Duration
+	Via       string // name of the person relaying for them ("" = direct)
 }
 
 type Room struct {
@@ -222,8 +231,15 @@ func (r *Room) Members() []MemberInfo {
 		}
 	}
 	sort.Slice(ps, func(i, j int) bool { return ps[i].joined < ps[j].joined })
+	now := time.Now()
 	for _, p := range ps {
-		out = append(out, MemberInfo{ID: p.id, Name: p.name, Connected: p.addr != nil && time.Since(p.lastRecv) < 10*time.Second, RTT: p.rtt})
+		mi := MemberInfo{ID: p.id, Name: p.name, Connected: r.directLocked(p, now), RTT: p.rtt}
+		if rel, cost := r.bestRelayLocked(p.id, now); rel != nil && (!mi.Connected || p.via == rel.id) {
+			if !mi.Connected || cost+relayGain < p.rtt {
+				mi.Connected, mi.RTT, mi.Via = true, cost, rel.name
+			}
+		}
+		out = append(out, mi)
 	}
 	return out
 }
@@ -456,8 +472,14 @@ func (r *Room) seal(t byte, payload []byte) []byte {
 	return r.aead.Seal(nonce, nonce, pt, nil)
 }
 
+// testBlock lets tests pretend two members can't reach each other directly.
+var testBlock func(fromPort, toPort int) bool
+
 func (r *Room) send(a *net.UDPAddr, pkt []byte) {
 	if a == nil {
+		return
+	}
+	if testBlock != nil && testBlock(r.conn.LocalAddr().(*net.UDPAddr).Port, a.Port) {
 		return
 	}
 	if n, err := r.conn.WriteToUDP(pkt, a); err == nil {
@@ -465,27 +487,112 @@ func (r *Room) send(a *net.UDPAddr, pkt []byte) {
 	}
 }
 
+// ---------- routing ----------
+//
+// Everyone sends to everyone directly when they can. When two people can't reach each
+// other (some routers block it) or the direct path is much slower, packets go through
+// whoever has the best ping to both. Relays only pass packets on as they are: they're
+// sealed with the room key by the original sender, so the receiver still sees who
+// sent them, and a relay never relays a relayed packet.
+
+const (
+	relayGain  = 40 * time.Millisecond // a relay must beat the direct path by this much
+	linksFresh = 5 * time.Second
+)
+
+func (r *Room) directLocked(p *peer, now time.Time) bool {
+	return p.addr != nil && now.Sub(p.lastRecv) < 10*time.Second
+}
+
+// bestRelayLocked: the directly connected member with the quickest path to id.
+func (r *Room) bestRelayLocked(id uint64, now time.Time) (*peer, time.Duration) {
+	var best *peer
+	var bestCost time.Duration
+	for _, q := range r.peers {
+		if q.id == id || q.gone || !r.directLocked(q, now) || now.Sub(q.linksAt) > linksFresh {
+			continue
+		}
+		d, ok := q.links[id]
+		if !ok {
+			continue
+		}
+		rtt := q.rtt
+		if rtt == 0 {
+			rtt = 100 * time.Millisecond
+		}
+		if c := rtt + d; best == nil || c < bestCost {
+			best, bestCost = q, c
+		}
+	}
+	return best, bestCost
+}
+
+type sendJob struct {
+	a   *net.UDPAddr
+	pkt []byte
+}
+
+// routeLocked: how to get a sealed packet to p (direct, through a relay, or not at all).
+func (r *Room) routeLocked(p *peer, pkt []byte, now time.Time) (sendJob, bool) {
+	direct := r.directLocked(p, now)
+	rel, cost := r.bestRelayLocked(p.id, now)
+	if rel != nil && (!direct || p.rtt > 0 && cost+relayGain < p.rtt) {
+		p.via = rel.id
+		w := make([]byte, 8+len(pkt))
+		binary.BigEndian.PutUint64(w, p.id)
+		copy(w[8:], pkt)
+		return sendJob{rel.addr, r.seal(pkRelay, w)}, true
+	}
+	p.via = 0
+	if direct {
+		return sendJob{p.addr, pkt}, true
+	}
+	return sendJob{}, false
+}
+
 // broadcast sends one packet to every connected member.
-func (r *Room) broadcast(t byte, payload []byte) {
+func (r *Room) broadcast(t byte, payload []byte) { r.broadcastSkip(t, payload, nil) }
+
+func (r *Room) broadcastSkip(t byte, payload []byte, skip func(uint64) bool) {
 	pkt := r.seal(t, payload)
+	now := time.Now()
 	r.mu.Lock()
-	var to []*net.UDPAddr
+	var jobs []sendJob
 	for _, p := range r.peers {
-		if !p.gone && p.addr != nil && time.Since(p.lastRecv) < 15*time.Second {
-			to = append(to, p.addr)
+		if p.gone || skip != nil && skip(p.id) {
+			continue
+		}
+		if j, ok := r.routeLocked(p, pkt, now); ok {
+			jobs = append(jobs, j)
 		}
 	}
 	r.mu.Unlock()
-	for _, a := range to {
-		r.send(a, pkt)
+	for _, j := range jobs {
+		r.send(j.a, j.pkt)
 	}
 }
 
 // SendVoice sends a voice payload to everyone in the room.
-func (r *Room) SendVoice(p []byte) {
+func (r *Room) SendVoice(p []byte) { r.SendVoiceSkip(p, nil) }
+
+// SendVoiceSkip sends to everyone except those skip says no to (too far away to hear).
+func (r *Room) SendVoiceSkip(p []byte, skip func(uint64) bool) {
 	if !r.closed.Load() {
-		r.broadcast(pkVoice, p)
+		r.broadcastSkip(pkVoice, p, skip)
 	}
+}
+
+// Size: how many people are in the room, you included.
+func (r *Room) Size() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 1
+	for _, p := range r.peers {
+		if !p.gone {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *Room) readLoop() {
@@ -510,61 +617,116 @@ func (r *Room) readLoop() {
 		if n < ns+9+r.aead.Overhead() {
 			continue
 		}
-		pt, err := r.aead.Open(nil, b[:ns], b[ns:], nil)
-		if err != nil || len(pt) < 9 {
-			continue
-		}
 		r.bytesIn.Add(int64(n))
-		t := pt[0]
-		id := binary.BigEndian.Uint64(pt[1:9])
-		payload := pt[9:]
-		if id == r.ID {
-			continue
-		}
-		r.mu.Lock()
-		p := r.peers[id]
-		if p == nil || (p.gone && t != pkBye && time.Since(p.lastAnn) > peerTimeout) {
-			// not announced in this room (yet): ignore until their announce arrives
-			r.mu.Unlock()
-			continue
-		}
-		first := p.addr == nil || time.Since(p.lastRecv) > 15*time.Second
-		wasGone := p.gone
-		if t == pkBye {
-			p.gone = true
-		} else {
-			p.gone = false
-			p.addr = from
-			p.lastRecv = time.Now()
-		}
-		name := p.name
+		r.handle(b, from, 0)
+	}
+}
+
+// handle one sealed packet. via is the member who relayed it (0 = it came directly).
+func (r *Room) handle(b []byte, from *net.UDPAddr, via uint64) {
+	ns := r.aead.NonceSize()
+	if len(b) < ns+9+r.aead.Overhead() {
+		return
+	}
+	pt, err := r.aead.Open(nil, b[:ns], b[ns:], nil)
+	if err != nil || len(pt) < 9 {
+		return
+	}
+	t := pt[0]
+	id := binary.BigEndian.Uint64(pt[1:9])
+	payload := pt[9:]
+	if id == r.ID {
+		return
+	}
+	if via != 0 && t != pkVoice && t != pkBye {
+		return // only voice (and goodbyes) travel through relays
+	}
+	r.mu.Lock()
+	p := r.peers[id]
+	if p == nil || (p.gone && t != pkBye && time.Since(p.lastAnn) > peerTimeout) {
+		// not announced in this room (yet): ignore until their announce arrives
 		r.mu.Unlock()
-		switch t {
-		case pkBye:
-			if !wasGone {
-				r.log("%s left the room.", name)
-				r.changed()
-			}
-			continue
-		case pkPing:
-			r.send(from, r.seal(pkPong, payload))
-		case pkPong:
-			if len(payload) == 8 {
-				d := time.Duration(time.Now().UnixNano() - int64(binary.BigEndian.Uint64(payload)))
-				r.mu.Lock()
-				p.rtt = d
-				r.mu.Unlock()
-			}
-		case pkVoice:
-			if r.OnVoice != nil {
-				r.OnVoice(id, payload)
-			}
-		}
-		if first {
-			r.log("Connected to %s.", name)
+		return
+	}
+	first := false
+	wasGone := p.gone
+	if t == pkBye {
+		p.gone = true
+	} else if via != 0 {
+		first = wasGone || time.Since(p.lastRelay) > 15*time.Second && !r.directLocked(p, time.Now())
+		p.gone = false
+		p.lastRelay = time.Now()
+	} else {
+		first = p.addr == nil || time.Since(p.lastRecv) > 15*time.Second
+		p.gone = false
+		p.addr = from
+		p.lastRecv = time.Now()
+	}
+	name := p.name
+	r.mu.Unlock()
+	switch t {
+	case pkBye:
+		if !wasGone {
+			r.log("%s left the room.", name)
 			r.changed()
 		}
+		return
+	case pkPing:
+		r.send(from, r.seal(pkPong, payload))
+	case pkPong:
+		if len(payload) == 8 {
+			d := time.Duration(time.Now().UnixNano() - int64(binary.BigEndian.Uint64(payload)))
+			r.mu.Lock()
+			p.rtt = d
+			r.mu.Unlock()
+		}
+	case pkVoice:
+		if r.OnVoice != nil {
+			r.OnVoice(id, payload)
+		}
+	case pkLinks:
+		m := map[uint64]time.Duration{}
+		for o := 0; o+10 <= len(payload); o += 10 {
+			m[binary.BigEndian.Uint64(payload[o:])] = time.Duration(binary.BigEndian.Uint16(payload[o+8:])) * time.Millisecond
+		}
+		r.mu.Lock()
+		p.links, p.linksAt = m, time.Now()
+		r.mu.Unlock()
+	case pkRelay: // pass a sealed packet on to someone we reach directly
+		if len(payload) > 8 {
+			r.mu.Lock()
+			q := r.peers[binary.BigEndian.Uint64(payload)]
+			var to *net.UDPAddr
+			if q != nil && !q.gone && q.id != id && r.directLocked(q, time.Now()) {
+				to = q.addr
+			}
+			r.mu.Unlock()
+			if to != nil {
+				r.send(to, r.seal(pkRelayed, payload[8:]))
+			}
+		}
+	case pkRelayed:
+		if via == 0 {
+			r.handle(payload, from, id)
+		}
 	}
+	if first {
+		if via != 0 {
+			r.log("Connected to %s (through %s).", name, r.nameOf(via))
+		} else {
+			r.log("Connected to %s.", name)
+		}
+		r.changed()
+	}
+}
+
+func (r *Room) nameOf(id uint64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p := r.peers[id]; p != nil {
+		return p.name
+	}
+	return "someone"
 }
 
 func (r *Room) tickLoop() {
@@ -607,14 +769,40 @@ func (r *Room) tickLoop() {
 				if p.addr != nil {
 					jobs = append(jobs, job{p.addr, punch})
 				}
-				// nobody answering and no recent announce: they've gone
-				if time.Since(p.lastRecv) > peerTimeout && time.Since(p.lastAnn) > peerTimeout {
+				// nobody answering, not reachable through anyone and no recent announce: they've gone
+				rel, _ := r.bestRelayLocked(id, time.Now())
+				if rel == nil && time.Since(p.lastRecv) > peerTimeout && time.Since(p.lastRelay) > peerTimeout && time.Since(p.lastAnn) > peerTimeout {
 					p.gone = true
 					changed = true
 					r.log("Lost connection to %s.", p.name)
 				}
 			} else if ping != nil {
 				jobs = append(jobs, job{p.addr, ping})
+			}
+		}
+		if n%5 == 0 { // once a second: tell everyone who we reach directly, so they can route through us
+			now := time.Now()
+			var lb []byte
+			var to []*net.UDPAddr
+			for id, p := range r.peers {
+				if p.gone || !r.directLocked(p, now) {
+					continue
+				}
+				var e [10]byte
+				binary.BigEndian.PutUint64(e[:], id)
+				ms := p.rtt.Milliseconds()
+				if ms <= 0 || ms > 65535 {
+					ms = 500
+				}
+				binary.BigEndian.PutUint16(e[8:], uint16(ms))
+				lb = append(lb, e[:]...)
+				to = append(to, p.addr)
+			}
+			if len(to) > 0 {
+				pkt := r.seal(pkLinks, lb)
+				for _, a := range to {
+					jobs = append(jobs, job{a, pkt})
+				}
 			}
 		}
 		reann := r.state == "in room" && time.Since(r.lastAnn) > announceEvery

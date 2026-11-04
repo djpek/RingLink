@@ -1116,6 +1116,9 @@ func (u *ui) memberRow(gtx layout.Context, m MemberInfo, vs VoiceStatus) layout.
 		sub, subC = "Connecting...", colWarn
 	default:
 		sub = fmt.Sprintf("%d ms", m.RTT.Milliseconds())
+		if m.Via != "" {
+			sub += " via " + m.Via
+		}
 		if hasPV {
 			if pv.Game != "" && pv.Game != vs.Game {
 				sub += " · in " + pv.Game

@@ -205,7 +205,23 @@ func (a *App) open(code string, creator bool) error {
 	a.mu.Lock()
 	a.room = r
 	a.mu.Unlock()
-	a.Voice.SetSender(r.SendVoice)
+	posN := 0
+	a.Voice.SetSender(func(p []byte) {
+		// big rooms: voice only goes to people close enough to hear it; positions go
+		// to far-away people 2x a second instead of 10x (enough to know when they're near)
+		if len(p) == 0 || r.Size() <= cullRoomAbove {
+			r.SendVoice(p)
+			return
+		}
+		if p[0] == vkPos {
+			posN++
+			if posN%5 == 0 {
+				r.SendVoice(p)
+				return
+			}
+		}
+		r.SendVoiceSkip(p, a.Voice.TooFar)
+	})
 	if creator {
 		a.Log("Room %s created (up to %d people). Send the code to your friends.", r.Code, a.S.MaxPeople)
 	} else {

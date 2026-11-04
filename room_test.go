@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"sync"
 	"testing"
@@ -133,4 +134,60 @@ func TestRealRelay(t *testing.T) {
 	defer b.Leave()
 	waitFor(t, "connected via ntfy", 30*time.Second, func() bool { return connectedCount(a) == 1 && connectedCount(b) == 1 })
 	_ = context.Background
+}
+
+// alice and carl can't reach each other (blocked both ways): their voice goes through bob.
+func TestRoomRelay(t *testing.T) {
+	stunServers = nil
+	h := newMemHub()
+	code := NewRoomCode()
+	logf := func(string, ...any) {} // rooms keep logging briefly after the test ends
+	a, _ := OpenRoom(code, "alice", 3, true, memSig(h, code), logf)
+	defer a.Leave()
+	waitFor(t, "creator in room", 10*time.Second, func() bool { s, _ := a.State(); return s == "in room" })
+	b, _ := OpenRoom(code, "bob", 0, false, memSig(h, code), logf)
+	defer b.Leave()
+	c, _ := OpenRoom(code, "carl", 0, false, memSig(h, code), logf)
+	defer c.Leave()
+	port := func(r *Room) int { return r.conn.LocalAddr().(*net.UDPAddr).Port }
+	pa, pc := port(a), port(c)
+	testBlock = func(from, to int) bool { return from == pa && to == pc || from == pc && to == pa }
+	defer func() { testBlock = nil }()
+
+	var mu sync.Mutex
+	got := map[string]int{}
+	a.OnVoice = func(from uint64, p []byte) {
+		if from == c.ID {
+			mu.Lock()
+			got[string(p)]++
+			mu.Unlock()
+		}
+	}
+	waitFor(t, "alice reaches carl through bob", 20*time.Second, func() bool {
+		for _, m := range a.Members() {
+			if m.Name == "carl" && m.Connected && m.Via == "bob" {
+				return true
+			}
+		}
+		return false
+	})
+	for i := 0; i < 5; i++ {
+		c.SendVoice([]byte{byte('0' + i)})
+	}
+	waitFor(t, "voice relayed", 5*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 5
+	})
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	for k, n := range got {
+		if n != 1 {
+			t.Fatalf("packet %q arrived %d times", k, n)
+		}
+	}
+	mu.Unlock()
+	if connectedCount(a) != 2 || connectedCount(c) != 2 {
+		t.Fatalf("not everyone shown connected: alice %d carl %d", connectedCount(a), connectedCount(c))
+	}
 }

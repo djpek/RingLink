@@ -253,6 +253,32 @@ func (v *Voice) SetSender(f func([]byte)) {
 	v.mu.Unlock()
 }
 
+// cullDist: in big rooms your voice isn't sent to cars further than this (the longest
+// "how far voices carry" setting is 500 m, so nobody could hear it anyway).
+const (
+	cullDist      = 600.0
+	cullRoomAbove = 8 // rooms up to this size always get everything
+)
+
+// TooFar: whether member id is too far from you to hear you right now. Unknown
+// positions (menus, garage, replays, other game) are never too far, and neither is
+// anyone while you're broadcasting.
+func (v *Voice) TooFar(id uint64) bool {
+	if v.Broadcasting() {
+		return false
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.broadcast || v.myPos == nil {
+		return false
+	}
+	p := v.peers[id]
+	if p == nil || p.pos == nil || p.game != v.myGame || time.Since(p.posSeen) > 3*time.Second {
+		return false
+	}
+	return v.distLocked(p) > cullDist
+}
+
 func (v *Voice) sender() func([]byte) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
