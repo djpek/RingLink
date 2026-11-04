@@ -33,9 +33,9 @@ type Settings struct {
 	BcastBind   string         `json:"broadcastBind,omitempty"` // push-to-broadcast key / wheel button
 	PTTBind     string         `json:"pushToTalkBind,omitempty"`
 	PTMBind     string         `json:"pushToMuteBind,omitempty"`
-	PushToTalk  bool           `json:"pushToTalk,omitempty"` // false = voice activated
-	FXClosed    bool           `json:"othersVoicesClosed,omitempty"`
-	PeerVol     map[string]int `json:"peerVolume,omitempty"` // per-person volume % by display name
+	PushToTalk  bool           `json:"pushToTalk,omitempty"`       // false = voice activated
+	FXOpen      bool           `json:"othersVoicesOpen,omitempty"` // closed unless you open it
+	PeerVol     map[string]int `json:"peerVolume,omitempty"`       // per-person volume % by display name
 }
 
 type App struct {

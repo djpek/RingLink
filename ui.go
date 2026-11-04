@@ -426,7 +426,7 @@ func (u *ui) update(gtx layout.Context) {
 		save = true
 	}
 	if u.fxBtn.Clicked(gtx) {
-		a.S.FXClosed = !a.S.FXClosed
+		a.S.FXOpen = !a.S.FXOpen
 		save = true
 	}
 	if a.Bind.CapturingFor() != "" {
@@ -1558,6 +1558,60 @@ func (u *ui) memberMenu(m MemberInfo, mu *memUI) layout.Widget {
 	}
 }
 
+// fxField: the "Other people's voices" dropdown, styled like the device pickers.
+func (u *ui) fxField(open bool) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		v := u.app.Voice
+		summary := fmt.Sprintf("%d%% · %d m", v.VolPct.Load(), v.RangeM.Load())
+		macro := op.Record(gtx.Ops)
+		d := u.fxBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			pointer.CursorPointer.Add(gtx.Ops)
+			return layout.Inset{Top: 10, Bottom: 10, Left: 14, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Min.X = gtx.Constraints.Max.X
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						sz := gtx.Dp(17)
+						gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+						return icGroup.Layout(gtx, colAccent)
+					}),
+					layout.Rigid(layout.Spacer{Width: 10}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						l := material.Label(u.th, 14, "Other people's voices")
+						l.Font.Weight = font.Medium
+						return l.Layout(gtx)
+					}),
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						l := material.Label(u.th, 13, summary)
+						l.Color = colMuted
+						l.MaxLines = 1
+						l.Alignment = text.End
+						return l.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: 6}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						sz := gtx.Dp(20)
+						gtx.Constraints = layout.Exact(image.Pt(sz, sz))
+						if open {
+							return icLess.Layout(gtx, colMuted)
+						}
+						return icExpand.Layout(gtx, colMuted)
+					}),
+				)
+			})
+		})
+		call := macro.Stop()
+		bg := colField
+		if u.fxBtn.Hovered() {
+			bg = colHover
+		}
+		sc := u.an.bounce(gtx, &u.fxBtn, popTarget(d.Size, u.fxBtn.Hovered(), u.fxBtn.Pressed()))
+		defer op.Affine(scaleAbout(d.Size, sc)).Push(gtx.Ops).Pop()
+		glass(gtx, d.Size, gtx.Dp(12), bg, color.NRGBA{255, 255, 255, 0x1c})
+		call.Add(gtx.Ops)
+		return d
+	}
+}
+
 func (u *ui) bindRow(act, label string) layout.Widget {
 	return func(gtx layout.Context) layout.Dimensions {
 		bb, ub := u.bindClick(act)
@@ -1694,43 +1748,18 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 				divider,
 			)
 		}
-		ws = append(ws,
-			func(gtx layout.Context) layout.Dimensions {
-				ic := icLess
-				if u.app.S.FXClosed {
-					ic = icExpand
-				}
-				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-						return material.Clickable(gtx, &u.fxBtn, func(gtx layout.Context) layout.Dimensions {
-							pointer.CursorPointer.Add(gtx.Ops)
-							return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
-								layout.Rigid(u.sectionLabel("Other people's voices")),
-								layout.Rigid(layout.Spacer{Width: 6}.Layout),
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-									sz := gtx.Dp(18)
-									gtx.Constraints = layout.Exact(image.Pt(sz, sz))
-									return ic.Layout(gtx, colMuted)
-								}),
-								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-									return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, gtx.Dp(20))}
-								}),
-							)
-						})
-					}),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						if u.app.S.FXClosed {
-							return layout.Dimensions{}
-						}
-						return u.button(&u.resetFX, icRestore, "Reset", btnGhost, false)(gtx)
-					}),
-				)
-			},
-		)
-		if u.app.S.FXClosed {
+		fxOpen := u.app.S.FXOpen
+		ws = append(ws, u.fxField(fxOpen))
+		if !fxOpen {
 			ws = append(ws, vgap(10), u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."))
 			return col(gtx, ws...)
 		}
+		ws = append(ws, vgap(10), func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, u.caption("How everyone else sounds to you.")),
+				layout.Rigid(u.button(&u.resetFX, icRestore, "Reset", btnGhost, false)),
+			)
+		})
 		ws = append(ws,
 			u.sliderRow("Volume", fmt.Sprintf("%d%%", v.VolPct.Load()), &u.vol),
 			vgap(6),
