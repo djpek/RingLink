@@ -211,6 +211,8 @@ func (u *ui) syncFX() {
 // memUI: the ⋮ menu state for one person in the room.
 type memUI struct {
 	more, copy widget.Clickable
+	muteAll    widget.Clickable // host / mods: mute for everyone
+	modBtn     widget.Clickable // host: make mod
 	vol        widget.Float
 	open       bool
 	volInit    bool
@@ -1162,9 +1164,18 @@ func (u *ui) memberRow(gtx layout.Context, m MemberInfo, vs VoiceStatus) layout.
 	if m.Self {
 		name += " (you)"
 	}
+	if m.Host {
+		name += " · Host"
+	} else if m.Mod {
+		name += " · Mod"
+	}
 	var sub string
 	var subC = colMuted
 	switch {
+	case m.Muted && m.Self:
+		sub, subC = "Muted for everyone by the host or a mod", colBad
+	case m.Muted && m.Connected:
+		sub, subC = "Muted for everyone", colBad
 	case m.Self && u.app.Voice.Muted.Load():
 		sub, subC = "Mic muted", colWarn
 	case m.Self:
@@ -1269,6 +1280,18 @@ func (u *ui) memberMenuEvents(gtx layout.Context, m MemberInfo, mu *memUI) {
 		}
 		a.S.PeerVol[m.Name] = pct
 	}
+	if r := a.Room(); r != nil {
+		if mu.muteAll.Clicked(gtx) {
+			if err := r.SetMuted(m.ID, !m.Muted); err != nil {
+				a.Log("%v", err)
+			}
+		}
+		if mu.modBtn.Clicked(gtx) {
+			if err := r.SetMod(m.ID, !m.Mod); err != nil {
+				a.Log("%v", err)
+			}
+		}
+	}
 	if mu.copy.Clicked(gtx) {
 		if vs := a.Voice.PeerSettings(m.ID); vs != nil {
 			v := a.Voice
@@ -1315,6 +1338,25 @@ func (u *ui) memberMenu(m MemberInfo, mu *memUI) layout.Widget {
 				u.caption(fmt.Sprintf("Volume %d%% · carry %d m · muffle %d%% · always muffled %d%% · directional %s · Doppler %d%%",
 					vs.Vol, vs.Range, vs.Muffle, vs.BaseMuff, dir, vs.Doppler)),
 			)
+		}
+		if r := u.app.Room(); r != nil && r.CanModerate() && !m.Host {
+			lbl, kind := "Mute for everyone", btnDanger
+			if m.Muted {
+				lbl, kind = "Unmute for everyone", btnSecondary
+			}
+			var mod []layout.FlexChild
+			mod = append(mod, layout.Flexed(1, u.button(&mu.muteAll, icMicOff, lbl, kind, true)))
+			if r.AmHost() {
+				ml := "Make mod"
+				if m.Mod {
+					ml = "Remove mod"
+				}
+				mod = append(mod, layout.Rigid(layout.Spacer{Width: 8}.Layout),
+					layout.Flexed(1, u.button(&mu.modBtn, icGroup, ml, btnSecondary, true)))
+			}
+			ws = append(ws, vgap(12), func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx, mod...)
+			}, vgap(4), u.caption("Mods can mute and unmute people. Only the host can make mods; nobody can mute the host."))
 		}
 		return layout.Inset{Left: 48, Bottom: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return col(gtx, ws...)

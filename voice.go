@@ -227,6 +227,7 @@ type Voice struct {
 	PTTMode  atomic.Bool  // push to talk instead of voice activated
 	PTTKey   atomic.Bool  // push-to-talk key held
 	PTMKey   atomic.Bool  // push-to-mute key held
+	HostMute atomic.Bool  // the host or a mod muted you for everyone
 	posKick  chan struct{}
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
@@ -672,7 +673,7 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 		} else {
 			talking = time.Since(v.lastLoud) < 350*time.Millisecond
 		}
-		talking = talking && !v.Muted.Load() && !v.PTMKey.Load()
+		talking = talking && !v.Muted.Load() && !v.PTMKey.Load() && !v.HostMute.Load()
 		v.talking.Store(talking)
 		if !talking {
 			if wasTalking { // stopped talking: send the rest of the low-quality packet

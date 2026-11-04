@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -101,14 +102,16 @@ func roomSecrets(code string) (key []byte, topic string) {
 // ---------- types ----------
 
 type announce struct {
-	Kind   string `json:"k"`           // "a" announce, "b" bye
-	ID     string `json:"id"`          // member id (hex)
-	Name   string `json:"n,omitempty"` // display name
-	Pub    string `json:"p,omitempty"` // public UDP address (from STUN)
-	LAN    string `json:"l,omitempty"` // LAN UDP address
-	Max    int    `json:"m,omitempty"` // room size limit (set by whoever made the room)
-	Joined int64  `json:"j,omitempty"` // unix ms when this member joined
-	T      int64  `json:"t"`           // unix ms when sent
+	Kind   string `json:"k"`            // "a" announce, "b" bye
+	ID     string `json:"id"`           // member id (hex)
+	Name   string `json:"n,omitempty"`  // display name
+	Pub    string `json:"p,omitempty"`  // public UDP address (from STUN)
+	LAN    string `json:"l,omitempty"`  // LAN UDP address
+	Max    int    `json:"m,omitempty"`  // room size limit (set by whoever made the room)
+	Joined int64  `json:"j,omitempty"`  // unix ms when this member joined
+	Key    string `json:"pk,omitempty"` // Ed25519 public key, for signed host / mod changes
+	Host   bool   `json:"h,omitempty"`  // the one who made the room
+	T      int64  `json:"t"`            // unix ms when sent
 }
 
 type peer struct {
@@ -126,6 +129,7 @@ type peer struct {
 	linksAt   time.Time
 	lastRelay time.Time // last packet from them that came through someone else
 	via       uint64    // relay we last used to reach them (0 = direct)
+	key       ed25519.PublicKey
 }
 
 type MemberInfo struct {
@@ -135,6 +139,8 @@ type MemberInfo struct {
 	Connected bool
 	RTT       time.Duration
 	Via       string // name of the person relaying for them ("" = direct)
+	Host, Mod bool
+	Muted     bool // muted for everyone by the host or a mod
 }
 
 type Room struct {
@@ -166,6 +172,7 @@ type Room struct {
 	closed    atomic.Bool
 	bytesIn   atomic.Int64
 	bytesOut  atomic.Int64
+	roles     roleState
 }
 
 // OpenRoom creates (creator=true) or joins a room. sig may be nil to use the
@@ -195,6 +202,7 @@ func OpenRoom(code, name string, max int, creator bool, sig Signaler, logf func(
 	r := &Room{Code: FormatCode(c), ID: binary.BigEndian.Uint64(idb[:]), Name: name, Creator: creator,
 		aead: aead, topic: topic, sig: sig, conn: conn, stun: make(chan []byte, 8), logf: logf,
 		max: max, joined: time.Now().UnixMilli(), peers: map[uint64]*peer{}, state: "starting"}
+	r.initRoles()
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	go r.readLoop()
 	go r.run()
@@ -223,7 +231,8 @@ func (r *Room) State() (state string, max int) {
 func (r *Room) Members() []MemberInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := []MemberInfo{{ID: r.ID, Name: r.Name, Self: true, Connected: true}}
+	out := []MemberInfo{{ID: r.ID, Name: r.Name, Self: true, Connected: true,
+		Host: r.roles.hostID == r.ID, Mod: r.roles.mods[r.ID], Muted: r.roles.muted[r.ID]}}
 	var ps []*peer
 	for _, p := range r.peers {
 		if !p.gone {
@@ -233,7 +242,8 @@ func (r *Room) Members() []MemberInfo {
 	sort.Slice(ps, func(i, j int) bool { return ps[i].joined < ps[j].joined })
 	now := time.Now()
 	for _, p := range ps {
-		mi := MemberInfo{ID: p.id, Name: p.name, Connected: r.directLocked(p, now), RTT: p.rtt}
+		mi := MemberInfo{ID: p.id, Name: p.name, Connected: r.directLocked(p, now), RTT: p.rtt,
+			Host: r.roles.hostID == p.id, Mod: r.roles.mods[p.id], Muted: r.roles.muted[p.id]}
 		if rel, cost := r.bestRelayLocked(p.id, now); rel != nil && (!mi.Connected || p.via == rel.id) {
 			if !mi.Connected || cost+relayGain < p.rtt {
 				mi.Connected, mi.RTT, mi.Via = true, cost, rel.name
@@ -383,7 +393,8 @@ func (r *Room) announce() {
 		return
 	}
 	r.mu.Lock()
-	a := announce{Kind: "a", ID: idHex(r.ID), Name: r.Name, Max: r.max, Joined: r.joined, T: time.Now().UnixMilli()}
+	a := announce{Kind: "a", ID: idHex(r.ID), Name: r.Name, Max: r.max, Joined: r.joined, T: time.Now().UnixMilli(),
+		Key: r.pubKeyB64(), Host: r.Creator}
 	if r.pub != nil {
 		a.Pub = r.pub.String()
 	}
@@ -437,6 +448,7 @@ func (r *Room) onSignal(msg []byte) {
 	p.gone = false
 	p.name = a.Name
 	p.joined = a.Joined
+	r.noteAnnouncedKeyLocked(p, a)
 	p.lastAnn = at
 	p.cands = nil
 	for _, s := range []string{a.Pub, a.LAN} {
@@ -638,7 +650,7 @@ func (r *Room) handle(b []byte, from *net.UDPAddr, via uint64) {
 	if id == r.ID {
 		return
 	}
-	if via != 0 && t != pkVoice && t != pkBye {
+	if via != 0 && t != pkVoice && t != pkBye && t != pkCtrl {
 		return // only voice (and goodbyes) travel through relays
 	}
 	r.mu.Lock()
@@ -681,8 +693,12 @@ func (r *Room) handle(b []byte, from *net.UDPAddr, via uint64) {
 			r.mu.Unlock()
 		}
 	case pkVoice:
-		if r.OnVoice != nil {
+		if r.OnVoice != nil && !r.MutedByHost(id) { // muted for everyone: dropped here too
 			r.OnVoice(id, payload)
+		}
+	case pkCtrl:
+		if r.applyDoc(append([]byte(nil), payload...)) {
+			r.changed()
 		}
 	case pkLinks:
 		m := map[uint64]time.Duration{}
@@ -805,8 +821,12 @@ func (r *Room) tickLoop() {
 				}
 			}
 		}
+		docs := r.shareRolesLocked()
 		reann := r.state == "in room" && time.Since(r.lastAnn) > announceEvery
 		r.mu.Unlock()
+		for _, d := range docs {
+			r.broadcast(pkCtrl, d)
+		}
 		for _, j := range jobs {
 			r.send(j.a, j.pkt)
 		}

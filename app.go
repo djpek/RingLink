@@ -230,6 +230,14 @@ func (a *App) open(code string, creator bool) error {
 				a.Voice.RemovePeer(id)
 			}
 		}
+		if m := r.MutedByHost(r.ID); m != a.Voice.HostMute.Load() {
+			a.Voice.HostMute.Store(m)
+			if m {
+				a.Log("You were muted by the host or a mod.")
+			} else {
+				a.Log("You were unmuted.")
+			}
+		}
 		a.poke()
 	}
 	a.mu.Lock()
@@ -281,6 +289,7 @@ func (a *App) LeaveRoom() {
 		return
 	}
 	a.Voice.SetSender(nil)
+	a.Voice.HostMute.Store(false)
 	a.Voice.Stop()
 	r.Leave()
 	a.Log("Left room %s.", r.Code)

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"net"
 	"os"
 	"sync"
@@ -190,4 +192,71 @@ func TestRoomRelay(t *testing.T) {
 	if connectedCount(a) != 2 || connectedCount(c) != 2 {
 		t.Fatalf("not everyone shown connected: alice %d carl %d", connectedCount(a), connectedCount(c))
 	}
+}
+
+// Host makes bob a mod, bob mutes carl for everyone: carl's voice is dropped by alice,
+// carl knows he's muted. carl (not a mod) can't unmute himself or mute the host, and a
+// change signed with the wrong key is ignored.
+func TestRoomHostAndMods(t *testing.T) {
+	stunServers = nil
+	h := newMemHub()
+	code := NewRoomCode()
+	logf := func(string, ...any) {}
+	a, _ := OpenRoom(code, "alice", 4, true, memSig(h, code), logf)
+	defer a.Leave()
+	waitFor(t, "creator in room", 10*time.Second, func() bool { s, _ := a.State(); return s == "in room" })
+	b, _ := OpenRoom(code, "bob", 0, false, memSig(h, code), logf)
+	defer b.Leave()
+	c, _ := OpenRoom(code, "carl", 0, false, memSig(h, code), logf)
+	defer c.Leave()
+	waitFor(t, "mesh", 20*time.Second, func() bool {
+		return connectedCount(a) == 2 && connectedCount(b) == 2 && connectedCount(c) == 2 &&
+			b.HostID() == a.ID && c.HostID() == a.ID
+	})
+	if !a.AmHost() || b.AmHost() || b.CanModerate() {
+		t.Fatal("roles wrong at start")
+	}
+	if err := b.SetMuted(c.ID, true); err == nil {
+		t.Fatal("non-mod could mute")
+	}
+	if err := a.SetMod(b.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "bob is mod everywhere", 5*time.Second, func() bool { return b.CanModerate() && c.IsMod(b.ID) })
+	if err := b.SetMuted(c.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "carl muted everywhere", 5*time.Second, func() bool {
+		return a.MutedByHost(c.ID) && c.MutedByHost(c.ID)
+	})
+	var got int
+	var mu sync.Mutex
+	a.OnVoice = func(from uint64, p []byte) { mu.Lock(); got++; mu.Unlock() }
+	c.SendVoice([]byte("hi"))
+	b.SendVoice([]byte("hi"))
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	if got != 1 {
+		t.Fatalf("alice got %d voice packets, want only bob's", got)
+	}
+	mu.Unlock()
+	if err := c.SetMuted(c.ID, false); err == nil {
+		t.Fatal("muted non-mod unmuted himself")
+	}
+	if err := b.SetMuted(a.ID, true); err == nil {
+		t.Fatal("mod muted the host")
+	}
+	// forged: carl signs an "unmute" claiming to be bob
+	forged := roleDoc{Kind: "mute", V: time.Now().UnixMilli() + 10000, By: idHex(b.ID)}
+	js, _ := json.Marshal(forged)
+	raw := append(ed25519.Sign(c.roles.priv, js), js...)
+	c.broadcast(pkCtrl, raw)
+	time.Sleep(500 * time.Millisecond)
+	if !a.MutedByHost(c.ID) {
+		t.Fatal("forged unmute was accepted")
+	}
+	// a late joiner learns the current roles
+	d, _ := OpenRoom(code, "dave", 0, false, memSig(h, code), logf)
+	defer d.Leave()
+	waitFor(t, "dave learns roles", 25*time.Second, func() bool { return d.IsMod(b.ID) && d.MutedByHost(c.ID) })
 }
