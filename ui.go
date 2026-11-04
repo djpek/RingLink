@@ -2104,8 +2104,8 @@ func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Wi
 		startY := float32(-top - r.y + (fd.Size.Y-r.size.Y)/2) // centred in the button
 		dy := int(startY * (1 - e))
 		sc := 0.9 + 0.1*e + 0.08*lift
-		// fades in while still behind the button, fully there once it's out
-		a := min(1, t/0.45)
+		// still fading in as it comes out of the button, fully there partway down
+		a := min(1, t/0.55)
 		alpha := a * a * (3 - 2*a)
 		// blurry behind the button and coming out, sharp as it lands
 		blurAmt := max(lift, float32(math.Pow(float64(1-e), 0.6)))
@@ -2132,9 +2132,10 @@ func (u *ui) dropdown(gtx layout.Context, key string, open bool, field layout.Wi
 		aff.Pop()
 		st.Pop()
 	}
-	// blocks start under the button (it's glass, so they fade in behind it) and never
-	// show above its top edge; the button is drawn over them
-	cl := clip.Rect{Min: image.Pt(-gtx.Dp(8), 0), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(8), top+shown+gtx.Dp(8))}.Push(gtx.Ops)
+	// blocks start under the button and the button hides them completely (nothing
+	// shows through it): they're only revealed as they come out of its bottom edge,
+	// still fading in and blurred
+	cl := clip.Rect{Min: image.Pt(-gtx.Dp(8), fd.Size.Y), Max: image.Pt(gtx.Constraints.Max.X+gtx.Dp(8), top+shown+gtx.Dp(8))}.Push(gtx.Ops)
 	// landed blocks first, blocks in the air on top of them, the button over everything
 	for i := range recs {
 		if prog(i) >= 1 {
