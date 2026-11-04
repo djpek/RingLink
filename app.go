@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +231,11 @@ func (a *App) open(code string, creator bool) error {
 				a.Voice.RemovePeer(id)
 			}
 		}
+		rules := r.Rules()
+		a.Voice.SetRules(rules.PitRadio, rules.Isolate, r.ID)
+		if sub := a.Voice.Sub(); sub != "" && !slices.ContainsFunc(rules.Subs, func(s string) bool { return strings.EqualFold(s, sub) }) {
+			a.Voice.SetSub("") // that sub-room was removed
+		}
 		if m := r.MutedByHost(r.ID); m != a.Voice.HostMute.Load() {
 			a.Voice.HostMute.Store(m)
 			if m {
@@ -247,7 +253,7 @@ func (a *App) open(code string, creator bool) error {
 	a.Voice.SetSender(func(p []byte) {
 		// big rooms: voice only goes to people close enough to hear it; positions go
 		// to far-away people 2x a second instead of 10x (enough to know when they're near)
-		if len(p) == 0 || r.Size() <= cullRoomAbove || p[0] == vkSettings {
+		if len(p) == 0 || r.Size() <= cullRoomAbove || p[0] == vkSettings || p[0] == vkPresence {
 			r.SendVoice(p)
 			return
 		}

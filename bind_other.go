@@ -89,9 +89,9 @@ func (j *jsInput) read(path string, n int, f *os.File) {
 
 func bindCaption() string {
 	if haveKeyboard {
-		return "Push-to-broadcast: everyone hears you at full volume, wherever they are on track. Keys and wheel / button-box buttons all work while the game is focused."
+		return "Push-to-broadcast: everyone (or just your sub-room, if you picked one) hears you at full volume, wherever they are. Keys and wheel / button-box buttons all work while the game is focused."
 	}
-	return "Push-to-broadcast: everyone hears you at full volume, wherever they are on track. Use buttons on your wheel / button box (keyboard keys need an X11 desktop)."
+	return "Push-to-broadcast: everyone (or just your sub-room, if you picked one) hears you at full volume, wherever they are. Use buttons on your wheel / button box (keyboard keys need an X11 desktop)."
 }
 
 func hidName(string) string { return "" }

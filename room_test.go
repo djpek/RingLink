@@ -259,4 +259,16 @@ func TestRoomHostAndMods(t *testing.T) {
 	d, _ := OpenRoom(code, "dave", 0, false, memSig(h, code), logf)
 	defer d.Leave()
 	waitFor(t, "dave learns roles", 25*time.Second, func() bool { return d.IsMod(b.ID) && d.MutedByHost(c.ID) })
+
+	// room rules: a mod turns pit radio off, adds sub-rooms and isolates alice
+	if err := c.SetRules(RoomRules{PitRadio: false}); err == nil {
+		t.Fatal("non-mod changed the room rules")
+	}
+	if err := b.SetRules(RoomRules{PitRadio: false, Isolate: a.ID, Subs: []string{"Team A", " team a ", "Team B"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "rules everywhere", 5*time.Second, func() bool {
+		r := d.Rules()
+		return !r.PitRadio && r.Isolate == a.ID && len(r.Subs) == 2 && !a.Rules().PitRadio
+	})
 }

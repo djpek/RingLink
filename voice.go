@@ -20,6 +20,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,7 @@ const (
 	legacyFrame  = 320
 	vkPos        = 2
 	vkSettings   = 4  // your "other people's voices" settings, so others can copy them (JSON)
+	vkPresence   = 6  // [flags: 1 in garage, 2 broadcasting][sub-room name length][name]
 	jitterTarget = 3  // frames buffered before a talker starts playing (60 ms)
 	jitterMax    = 12 // drop old frames beyond this (240 ms)
 	spkChannels  = 2  // stereo out, so voices can come from the left or right
@@ -81,8 +83,12 @@ type vpeer struct {
 	mt       motion  // their car's movement, for guessing where it is now
 	userVol  float64 // your volume for this person (1 = 100 %), if userSet
 	userSet  bool
-	fullAt   time.Time      // last full-quality voice packet from them
-	lowAt    time.Time      // last low-quality one (arrives 60 ms at a time: buffer a bit more)
+	fullAt   time.Time // last full-quality voice packet from them
+	lowAt    time.Time // last low-quality one (arrives 60 ms at a time: buffer a bit more)
+	inGarage bool      // from their presence packets
+	bcasting bool
+	sub      string // sub-room they picked
+	presAt   time.Time
 	shared   *VoiceSettings // their voice settings, if they've sent them
 	talkAt   time.Time
 	gain     float64 // playback goroutine only
@@ -228,6 +234,13 @@ type Voice struct {
 	PTTKey   atomic.Bool  // push-to-talk key held
 	PTMKey   atomic.Bool  // push-to-mute key held
 	HostMute atomic.Bool  // the host or a mod muted you for everyone
+
+	// room rules (from the host / mods) and where you are
+	pitRadio bool   // garage = everyone at full volume (default on)
+	isolate  uint64 // everyone hears only this member
+	selfID   uint64
+	inGarage bool
+	mySub    string
 	posKick  chan struct{}
 	micLevel atomic.Int32 // 0..100 for the meter
 	talking  atomic.Bool
@@ -238,6 +251,7 @@ type Voice struct {
 func NewVoice(logf func(string, ...any), notify func()) *Voice {
 	v := &Voice{logf: logf, notify: notify, peers: map[uint64]*vpeer{}, Replay: NewReplayVoice(), posKick: make(chan struct{}, 1)}
 	v.Replay.Run(make(chan struct{})) // session clock + replay position, for as long as the app runs
+	v.pitRadio = true
 	v.Sens.Store(60)
 	v.VolPct.Store(100)
 	v.RangeM.Store(150)
@@ -292,6 +306,72 @@ func (v *Voice) TooFar(id uint64) bool {
 		return false
 	}
 	return v.distLocked(p) > cullDist
+}
+
+// SetRules applies the room's rules from the host / mods; selfID is your member id.
+func (v *Voice) SetRules(pitRadio bool, isolate, selfID uint64) {
+	v.mu.Lock()
+	changed := v.pitRadio != pitRadio
+	v.pitRadio, v.isolate, v.selfID = pitRadio, isolate, selfID
+	v.mu.Unlock()
+	if changed {
+		v.KickPos()
+	}
+}
+
+// SetSub picks your sub-room for the pits ("" = none).
+func (v *Voice) SetSub(name string) {
+	v.mu.Lock()
+	v.mySub = name
+	v.mu.Unlock()
+	v.KickPos()
+}
+
+func (v *Voice) Sub() string { v.mu.Lock(); defer v.mu.Unlock(); return v.mySub }
+
+// PeerPresence: whether someone is in the garage and which sub-room they picked.
+func (v *Voice) PeerPresence(id uint64) (inGarage bool, sub string, ok bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	p := v.peers[id]
+	if p == nil || time.Since(p.presAt) > 3*time.Second {
+		return false, "", false
+	}
+	return p.inGarage, p.sub, true
+}
+
+// InGarage: you're in the garage right now (LMU).
+func (v *Voice) InGarage() bool { v.mu.Lock(); defer v.mu.Unlock(); return v.inGarage }
+
+const isolateFade = 0.15 // everyone else's volume while someone is isolated
+
+// peerGainLocked: how loud you hear member id, by the room's rules:
+// isolate > broadcasting > sub-rooms in the pits > distance.
+func (v *Voice) peerGainLocked(id uint64, p *vpeer, d float64) float64 {
+	full := float64(v.VolPct.Load()) / 100
+	g := v.gainFor(d)
+	pres := time.Since(p.presAt) < 3*time.Second
+	switch {
+	case v.isolate != 0 && id == v.isolate:
+		g = full
+	case v.isolate != 0:
+		g *= isolateFade
+	case pres && p.bcasting && (p.sub == "" || strings.EqualFold(p.sub, v.mySub)):
+		// broadcasting reaches everyone, or only their sub-room if they're in one (team
+		// radio); people outside it hear them by distance as usual
+		g = full
+	case pres && p.bcasting && !v.inGarage:
+		// you're on track, they're broadcasting to another sub-room: just distance
+	case v.pitRadio && (v.inGarage && v.mySub != "" || pres && p.inGarage && p.sub != ""):
+		// someone in the pits is in a sub-room: only people in the pits in the same
+		// sub-room hear each other (on track it's back to everyone)
+		if v.inGarage && pres && p.inGarage && strings.EqualFold(v.mySub, p.sub) {
+			g = full
+		} else {
+			g = 0
+		}
+	}
+	return g * p.volMul()
 }
 
 // SetLowSender: where low-quality packets go (the app sends them only to far-away
@@ -412,7 +492,7 @@ func (v *Voice) Status() VoiceStatus {
 		st.Peers[id] = PeerVoice{
 			Talking: time.Since(p.talkAt) < 400*time.Millisecond,
 			Dist:    d,
-			Volume:  int(math.Round(v.gainFor(d) * p.volMul() * 100)),
+			Volume:  int(math.Round(v.peerGainLocked(id, p, d) * 100)),
 			Muffled: int(math.Round(v.muffleFor(d) * 100)),
 			OnTrack: p.pos != nil && time.Since(p.posSeen) < 3*time.Second,
 			Game:    gameName(p.game),
@@ -812,6 +892,13 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 			v.mu.Unlock()
 			v.onFrames(from, frs)
 		}
+	case vkPresence:
+		if len(b) >= 3 && len(b) >= 3+int(b[2]) {
+			v.mu.Lock()
+			p := v.peerLocked(from)
+			p.inGarage, p.bcasting, p.sub, p.presAt = b[1]&1 != 0, b[1]&2 != 0, string(b[3:3+int(b[2])]), time.Now()
+			v.mu.Unlock()
+		}
 	case vkSettings:
 		var vs VoiceSettings
 		if json.Unmarshal(b[1:], &vs) == nil {
@@ -861,13 +948,13 @@ func (v *Voice) playLoop(spk speakerSink, stop chan struct{}) {
 		v.mu.Lock()
 		now := time.Now()
 		dop := float64(v.Doppler.Load()) / 100
-		for _, p := range v.peers {
+		for id, p := range v.peers {
 			d := v.distLocked(p)
 			fr := p.nextFrameLocked(p.dopplerRateLocked(d, now, dop))
 			pan, behind := v.dirLocked(p)
 			m := v.muffleFor(d)
 			m = 1 - (1-m)*(1-0.3*behind) // voices from behind you are a bit duller
-			jobs = append(jobs, mixJob{p, fr, v.gainFor(d) * p.volMul(), m, pan})
+			jobs = append(jobs, mixJob{p, fr, v.peerGainLocked(id, p, d), m, pan})
 		}
 		// voices recorded at this moment of the replay you're watching: queued per speaker
 		// (so they play back smoothly) and heard from where their car was, relative to
@@ -1011,12 +1098,27 @@ func (v *Voice) posLoop(stop chan struct{}) {
 	t := time.NewTicker(100 * time.Millisecond) // LMU updates positions every 200 ms: catch each one quickly
 	defer t.Stop()
 	tick := 0
+	var lastPres []byte
 	for {
 		select {
 		case <-stop:
 			return
 		case <-t.C:
 		case <-v.posKick:
+		}
+		v.mu.Lock()
+		pres := []byte{vkPresence, 0, byte(len(v.mySub))}
+		if v.inGarage {
+			pres[1] |= 1
+		}
+		v.mu.Unlock()
+		if v.Broadcasting() {
+			pres[1] |= 2
+		}
+		pres = append(pres, v.Sub()...)
+		if send := v.sender(); send != nil && (tick%10 == 0 || string(pres) != string(lastPres)) {
+			send(pres)
+			lastPres = pres
 		}
 		if tick++; tick%30 == 1 { // every 3 s: share your voice settings so others can copy them
 			if send := v.sender(); send != nil {
@@ -1039,11 +1141,17 @@ func (v *Voice) posLoop(stop chan struct{}) {
 			if st := readLMU(cl); st.ok {
 				inReplay := v.Replay.InReplay()
 				v.Replay.SetListener(st.focus, st.focusVl, inReplay)
+				v.mu.Lock()
+				pitRadio := v.pitRadio
+				v.inGarage = st.inGarage && !inReplay
+				v.mu.Unlock()
 				switch {
-				case inReplay || st.inGarage:
+				case inReplay || st.inGarage && pitRadio:
 					broadcast = true
-				case st.pos != nil:
+				case st.pos != nil: // pit radio off: the garage is just a place on the map
 					pos, vel, game = st.pos, st.vel, gameLMU
+				case st.inGarage:
+					broadcast = true
 				}
 			}
 		}

@@ -170,3 +170,49 @@ func TestLowQualityVoice(t *testing.T) {
 	}
 	t.Logf("low quality: %d bytes per 60 ms vs %d (%.0f%%)", low, full, 100*float64(low)/float64(full))
 }
+
+// Room rules: sub-rooms only apply in the pits, broadcasting beats them, isolate beats everything.
+func TestRoomHearingRules(t *testing.T) {
+	v := NewVoice(func(string, ...any) {}, func() {})
+	v.VolPct.Store(100)
+	now := time.Now()
+	mk := func(garage bool, sub string, bc bool) *vpeer {
+		return &vpeer{inGarage: garage, sub: sub, bcasting: bc, presAt: now}
+	}
+	teammate, rival, onTrack, caster := mk(true, "Team A", false), mk(true, "Team B", false), mk(false, "Team A", false), mk(true, "", true)
+	g := func(id uint64, p *vpeer) float64 { return v.peerGainLocked(id, p, -1) }
+
+	v.SetRules(true, 0, 99)
+	v.inGarage, v.mySub = true, "team a" // case doesn't matter
+	if g(1, teammate) != 1 || g(2, rival) != 0 || g(3, onTrack) != 0 || g(4, caster) != 1 {
+		t.Fatalf("in the pits with a sub-room: teammate %.2f rival %.2f on-track %.2f broadcaster %.2f",
+			g(1, teammate), g(2, rival), g(3, onTrack), g(4, caster))
+	}
+	v.inGarage = false // you go out on track: everyone, by distance (-1 = unknown = full)
+	if g(3, onTrack) != 1 {
+		t.Fatalf("on track you should hear an on-track teammate: %.2f", g(3, onTrack))
+	}
+	if g(2, rival) != 0 {
+		t.Fatalf("someone in another sub-room in the pits stays private: %.2f", g(2, rival))
+	}
+	// broadcasting to a sub-room is team radio: teammates hear it anywhere, others don't
+	teamCast := &vpeer{inGarage: false, sub: "Team A", bcasting: true, presAt: now}
+	otherCast := &vpeer{inGarage: false, sub: "Team B", bcasting: true, presAt: now}
+	if g(5, teamCast) != 1 {
+		t.Fatalf("teammate's broadcast on track: %.2f", g(5, teamCast))
+	}
+	v.inGarage = true
+	if g(6, otherCast) != 0 {
+		t.Fatalf("other team's broadcast reached your sub-room in the pits: %.2f", g(6, otherCast))
+	}
+	v.inGarage = false
+	v.SetRules(false, 0, 99) // pit radio off: no sub-room privacy, just distance
+	v.inGarage = true
+	if g(2, rival) != 1 {
+		t.Fatalf("pit radio off: %.2f", g(2, rival))
+	}
+	v.SetRules(true, 2, 99) // isolate the rival
+	if g(2, rival) != 1 || math.Abs(g(1, teammate)-isolateFade) > 1e-9 {
+		t.Fatalf("isolate: rival %.2f teammate %.2f", g(2, rival), g(1, teammate))
+	}
+}

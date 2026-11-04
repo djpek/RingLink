@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -132,7 +133,10 @@ type ui struct {
 	bindBtns, unbindBtns       map[string]*widget.Clickable // per action
 	pttBtn, fxBtn              widget.Clickable
 	mem                        map[uint64]*memUI // per person in the room
-	micLevelKey                byte              // animation key for the mic level bar (must not share the sensitivity slider's)
+	pitBtn, addSub, stopIso    widget.Clickable
+	subEd                      widget.Editor
+	subPick, subDel            map[string]*widget.Clickable
+	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
 	formErr                    string
 	copiedAt                   time.Time
 	showLog                    bool
@@ -212,6 +216,7 @@ func (u *ui) syncFX() {
 type memUI struct {
 	more, copy widget.Clickable
 	muteAll    widget.Clickable // host / mods: mute for everyone
+	isoBtn     widget.Clickable // host / mods: isolate for everyone
 	modBtn     widget.Clickable // host: make mod
 	vol        widget.Float
 	open       bool
@@ -1141,13 +1146,168 @@ func (u *ui) inRoom(gtx layout.Context, r *Room) layout.Dimensions {
 		},
 		vgap(4),
 	}
+	rules := r.Rules()
+	if rules.Isolate != 0 {
+		ws = append(ws, u.isolateBanner(r, rules, members), vgap(6))
+	}
 	for _, m := range members {
 		m := m
 		ws = append(ws, func(gtx layout.Context) layout.Dimensions {
 			return u.memberRow(gtx, m, vs)
 		})
 	}
+	ws = append(ws, u.pitsSection(r, rules)...)
 	return col(gtx, ws...)
+}
+
+func (u *ui) subClick(m *map[string]*widget.Clickable, name string) *widget.Clickable {
+	if *m == nil {
+		*m = map[string]*widget.Clickable{}
+	}
+	c := (*m)[name]
+	if c == nil {
+		c = new(widget.Clickable)
+		(*m)[name] = c
+	}
+	return c
+}
+
+func (u *ui) isolateBanner(r *Room, rules RoomRules, members []MemberInfo) layout.Widget {
+	name := "someone"
+	for _, m := range members {
+		if m.ID == rules.Isolate {
+			name = m.Name
+		}
+	}
+	return func(gtx layout.Context) layout.Dimensions {
+		if u.stopIso.Clicked(gtx) {
+			nr := r.Rules()
+			nr.Isolate = 0
+			if err := r.SetRules(nr); err != nil {
+				u.app.Log("%v", err)
+			}
+		}
+		ch := []layout.FlexChild{layout.Flexed(1, u.label(13.5, "Everyone is hearing only "+name+" right now; the rest are faded.", colWarn))}
+		if r.CanModerate() {
+			ch = append(ch, layout.Rigid(layout.Spacer{Width: 8}.Layout), layout.Rigid(u.button(&u.stopIso, icRestore, "Stop", btnSecondary, false)))
+		}
+		return layout.Flex{Alignment: layout.Middle}.Layout(gtx, ch...)
+	}
+}
+
+// pitsSection: pick your sub-room; host / mods also get pit radio and the sub-room list.
+func (u *ui) pitsSection(r *Room, rules RoomRules) []layout.Widget {
+	a := u.app
+	mod := r.CanModerate()
+	if !mod && len(rules.Subs) == 0 {
+		return nil
+	}
+	ws := []layout.Widget{divider, u.sectionLabel("Pits")}
+	if mod {
+		ws = append(ws, func(gtx layout.Context) layout.Dimensions {
+			if u.pitBtn.Clicked(gtx) {
+				nr := r.Rules()
+				nr.PitRadio = !nr.PitRadio
+				if err := r.SetRules(nr); err != nil {
+					a.Log("%v", err)
+				}
+			}
+			lbl, kind := "Off", btnGhost
+			if rules.PitRadio {
+				lbl, kind = "On", btnPrimary
+			}
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, u.label(13.5, "Pit radio", colText)),
+				layout.Rigid(u.button(&u.pitBtn, icBcast, lbl, kind, false)),
+			)
+		}, u.caption(map[bool]string{true: "In the garage everyone hears each other at full volume (or just their sub-room). Changes it for the whole room.",
+			false: "The garage is like anywhere else: you hear people by distance. Changes it for the whole room."}[rules.PitRadio]), vgap(10))
+	}
+	if len(rules.Subs) > 0 {
+		cur := a.Voice.Sub()
+		opts := append([]string{""}, rules.Subs...)
+		ws = append(ws, u.label(13.5, "Your sub-room", colText), vgap(6))
+		for i := 0; i < len(opts); i += 3 {
+			rowOpts := opts[i:min(i+3, len(opts))]
+			ws = append(ws, func(gtx layout.Context) layout.Dimensions {
+				var ch []layout.FlexChild
+				for k, o := range rowOpts {
+					o := o
+					c := u.subClick(&u.subPick, o)
+					if c.Clicked(gtx) {
+						a.Voice.SetSub(o)
+					}
+					lbl, kind := o, btnSecondary
+					if o == "" {
+						lbl = "None"
+					}
+					if strings.EqualFold(o, cur) {
+						kind = btnPrimary
+					}
+					if k > 0 {
+						ch = append(ch, layout.Rigid(layout.Spacer{Width: 8}.Layout))
+					}
+					ch = append(ch, layout.Flexed(1, u.button(c, nil, lbl, kind, true)))
+				}
+				for k := len(rowOpts); k < 3; k++ { // keep columns even
+					ch = append(ch, layout.Rigid(layout.Spacer{Width: 8}.Layout), layout.Flexed(1, func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{} }))
+				}
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx, ch...)
+			}, vgap(8))
+		}
+		ws = append(ws, u.caption("In the garage (with pit radio on) you only hear and talk to your sub-room. On track you hear everyone as usual."))
+	}
+	if mod {
+		ws = append(ws, vgap(10), func(gtx layout.Context) layout.Dimensions {
+			if u.addSub.Clicked(gtx) || submitted(gtx, &u.subEd) {
+				if name := strings.TrimSpace(u.subEd.Text()); name != "" {
+					nr := r.Rules()
+					nr.Subs = append(nr.Subs, name)
+					if err := r.SetRules(nr); err != nil {
+						a.Log("%v", err)
+					}
+					u.subEd.SetText("")
+				}
+			}
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Flexed(1, u.input(&u.subEd, "New sub-room, e.g. Team A", false)),
+				layout.Rigid(layout.Spacer{Width: 8}.Layout),
+				layout.Rigid(u.button(&u.addSub, icAdd, "Add", btnSecondary, false)),
+			)
+		})
+		for _, sname := range rules.Subs {
+			sname := sname
+			ws = append(ws, vgap(4), func(gtx layout.Context) layout.Dimensions {
+				c := u.subClick(&u.subDel, sname)
+				if c.Clicked(gtx) {
+					nr := r.Rules()
+					nr.Subs = slices.DeleteFunc(nr.Subs, func(x string) bool { return x == sname })
+					if err := r.SetRules(nr); err != nil {
+						a.Log("%v", err)
+					}
+				}
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					layout.Flexed(1, u.label(13.5, sname, colText)),
+					layout.Rigid(u.button(c, icRemove, "Remove", btnGhost, false)),
+				)
+			})
+		}
+	}
+	return ws
+}
+
+// submitted: Enter was pressed in a single-line editor.
+func submitted(gtx layout.Context, ed *widget.Editor) bool {
+	ed.SingleLine, ed.Submit = true, true
+	for {
+		ev, ok := ed.Update(gtx)
+		if !ok {
+			return false
+		}
+		if _, ok := ev.(widget.SubmitEvent); ok {
+			return true
+		}
+	}
 }
 
 func capitalize(s string) string {
@@ -1186,6 +1346,12 @@ func (u *ui) memberRow(gtx layout.Context, m MemberInfo, vs VoiceStatus) layout.
 		sub = fmt.Sprintf("%d ms", m.RTT.Milliseconds())
 		if m.Via != "" {
 			sub += " via " + m.Via
+		}
+		if g, sr, ok := u.app.Voice.PeerPresence(m.ID); ok && g {
+			sub += " · in the pits"
+			if sr != "" {
+				sub += " (" + sr + ")"
+			}
 		}
 		if hasPV {
 			if pv.Game != "" && pv.Game != vs.Game {
@@ -1281,6 +1447,17 @@ func (u *ui) memberMenuEvents(gtx layout.Context, m MemberInfo, mu *memUI) {
 		a.S.PeerVol[m.Name] = pct
 	}
 	if r := a.Room(); r != nil {
+		if mu.isoBtn.Clicked(gtx) {
+			nr := r.Rules()
+			if nr.Isolate == m.ID {
+				nr.Isolate = 0
+			} else {
+				nr.Isolate = m.ID
+			}
+			if err := r.SetRules(nr); err != nil {
+				a.Log("%v", err)
+			}
+		}
 		if mu.muteAll.Clicked(gtx) {
 			if err := r.SetMuted(m.ID, !m.Muted); err != nil {
 				a.Log("%v", err)
@@ -1346,6 +1523,11 @@ func (u *ui) memberMenu(m MemberInfo, mu *memUI) layout.Widget {
 			}
 			var mod []layout.FlexChild
 			mod = append(mod, layout.Flexed(1, u.button(&mu.muteAll, icMicOff, lbl, kind, true)))
+			isoLbl := "Isolate for everyone"
+			if r.Rules().Isolate == m.ID {
+				isoLbl = "Stop isolating"
+			}
+			mod = append(mod, layout.Rigid(layout.Spacer{Width: 8}.Layout), layout.Flexed(1, u.button(&mu.isoBtn, icVolume, isoLbl, btnSecondary, true)))
 			if r.AmHost() {
 				ml := "Make mod"
 				if m.Mod {
@@ -1356,7 +1538,7 @@ func (u *ui) memberMenu(m MemberInfo, mu *memUI) layout.Widget {
 			}
 			ws = append(ws, vgap(12), func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Alignment: layout.Middle}.Layout(gtx, mod...)
-			}, vgap(4), u.caption("Mods can mute and unmute people. Only the host can make mods; nobody can mute the host."))
+			}, vgap(4), u.caption("Isolate: everyone hears only this person, everyone else faded. Mods can mute, unmute and isolate; only the host makes mods, and nobody can mute the host."))
 		}
 		return layout.Inset{Left: 48, Bottom: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return col(gtx, ws...)
@@ -1432,7 +1614,11 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 				},
 				vgap(10),
 				func(gtx layout.Context) layout.Dimensions {
-					lbl, kind := "Broadcast to everyone", btnSecondary
+					target := "everyone"
+					if sub := v.Sub(); sub != "" {
+						target = sub
+					}
+					lbl, kind := "Broadcast to "+target, btnSecondary
 					if v.BcastBtn.Load() {
 						lbl, kind = "Broadcasting — tap to stop", btnPrimary
 					} else if v.BcastKey.Load() {

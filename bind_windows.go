@@ -70,7 +70,7 @@ func (w *winInput) pressed() map[string]bool {
 }
 
 func bindCaption() string {
-	return "Push-to-broadcast: everyone hears you at full volume, wherever they are on track. Keys and wheel / button-box buttons all work while the game is focused."
+	return "Push-to-broadcast: everyone (or just your sub-room, if you picked one) hears you at full volume, wherever they are. Keys and wheel / button-box buttons all work while the game is focused."
 }
 
 func x11KeyName(int) string { return "" }
