@@ -25,6 +25,8 @@ You can set how loud everyone is, how far voices carry, how muffled they get wit
 
 ### Voice features
 
+<p align="center"><img src="docs/voice.png" width="380" alt="RingLink voice settings: broadcast, push-to-broadcast, volume, range, muffle, directional sound, Doppler and voice in replays"></p>
+
 - **Directional sound:** voices come from where their car is, left, right or behind you (stereo, follows your car's direction; head turning in VR isn't tracked).
 - **Always muffled:** muffles everyone all the time, like talking through helmets or a team radio.
 - **Doppler effect:** a car closing on you sounds slightly higher, one pulling away slightly lower.
