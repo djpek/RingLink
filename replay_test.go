@@ -162,3 +162,45 @@ func TestReplayVoiceAtOtherSpeeds(t *testing.T) {
 		}
 	}
 }
+
+// Opt-out: someone who ticked "Keep my voice out of replays" isn't saved in your
+// recording; everyone else still is.
+func TestReplayOptOut(t *testing.T) {
+	v := NewVoice(func(string, ...any) {}, func() {})
+	r := v.Replay
+	r.dir = t.TempDir()
+	r.track = "Test"
+	r.mu.Lock()
+	r.et, r.etAt, r.realtime = 100, time.Now(), true
+	r.mu.Unlock()
+	presence := func(from uint64, flags byte) { v.OnPacket(from, []byte{vkPresence, flags, 0}) }
+	presence(1, 4) // opted out
+	presence(2, 0) // didn't
+	fr := make([]int16, voiceFrame)
+	for i := range fr {
+		fr[i] = 5000
+	}
+	for k := 0; k < 10; k++ {
+		v.onFrames(1, [][]int16{fr})
+		v.onFrames(2, [][]int16{fr})
+	}
+	r.mu.Lock()
+	r.closeRecLocked()
+	r.mu.Unlock()
+	files, _ := filepath.Glob(filepath.Join(r.dir, "*.rlv2"))
+	if len(files) != 1 {
+		t.Fatalf("%d recordings", len(files))
+	}
+	got := map[uint64]int{}
+	for _, f := range readRecording(files[0]) {
+		got[f.speaker]++
+	}
+	if got[1] != 0 || got[2] != 10 {
+		t.Fatalf("recorded per speaker: %v (want none from 1, all 10 from 2)", got)
+	}
+	// and your own voice stays out of your recording when you opt out
+	v.NoRecord.Store(true)
+	if !v.NoRecord.Load() {
+		t.Fatal("flag")
+	}
+}

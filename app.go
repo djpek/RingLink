@@ -33,6 +33,7 @@ type Settings struct {
 	BcastBind   string         `json:"broadcastBind,omitempty"` // push-to-broadcast key / wheel button
 	PTTBind     string         `json:"pushToTalkBind,omitempty"`
 	PTMBind     string         `json:"pushToMuteBind,omitempty"`
+	NoRecord    bool           `json:"noReplayRecord,omitempty"`   // keep my voice out of replays (mine and others')
 	PushToTalk  bool           `json:"pushToTalk,omitempty"`       // false = voice activated
 	FXOpen      bool           `json:"othersVoicesOpen,omitempty"` // closed unless you open it
 	PeerVol     map[string]int `json:"peerVolume,omitempty"`       // per-person volume % by display name
@@ -79,6 +80,7 @@ func NewApp(notify func()) *App {
 		a.Voice.Replay.SetEnabled(*a.S.ReplayVoice)
 	}
 	a.Voice.PTTMode.Store(a.S.PushToTalk)
+	a.Voice.NoRecord.Store(a.S.NoRecord)
 	a.Bind = NewBinder()
 	a.Bind.SetBind(actBroadcast, a.S.BcastBind)
 	a.Bind.SetBind(actPTT, a.S.PTTBind)

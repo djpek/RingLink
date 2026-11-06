@@ -87,6 +87,7 @@ type vpeer struct {
 	lowAt    time.Time // last low-quality one (arrives 60 ms at a time: buffer a bit more)
 	inGarage bool      // from their presence packets
 	bcasting bool
+	noRecord bool   // they opted out of being in other people's replays
 	sub      string // sub-room they picked
 	presAt   time.Time
 	shared   *VoiceSettings // their voice settings, if they've sent them
@@ -234,6 +235,7 @@ type Voice struct {
 	PTTKey   atomic.Bool  // push-to-talk key held
 	PTMKey   atomic.Bool  // push-to-mute key held
 	HostMute atomic.Bool  // the host or a mod muted you for everyone
+	NoRecord atomic.Bool  // you opted out of your voice being saved in replays (yours and others')
 
 	// room rules (from the host / mods) and where you are
 	pitRadio bool   // garage = everyone at full volume (default on)
@@ -806,7 +808,7 @@ func (v *Voice) captureLoop(mic micSource, stop chan struct{}) {
 			if low := lowEnc.add(fr); low != nil {
 				v.sendLow(low)
 			}
-			if v.Replay.Enabled() {
+			if v.Replay.Enabled() && !v.NoRecord.Load() {
 				v.mu.Lock()
 				mp := v.myPos
 				v.mu.Unlock()
@@ -842,8 +844,9 @@ func (v *Voice) onFrames(from uint64, frs [][]int16) {
 		if loud {
 			p.talkAt = time.Now()
 		}
-		// saved for replays whether or not you can hear it right now (voice off, too far away)
-		if v.Replay.Enabled() {
+		// saved for replays whether or not you can hear it right now (voice off, too far
+		// away), unless they've opted out of being recorded
+		if v.Replay.Enabled() && !p.noRecord {
 			ul := make([]byte, voiceFrame)
 			for i, x := range fr {
 				ul[i] = linearToULaw(x)
@@ -914,6 +917,7 @@ func (v *Voice) OnPacket(from uint64, b []byte) {
 			v.mu.Lock()
 			p := v.peerLocked(from)
 			p.inGarage, p.bcasting, p.sub, p.presAt = b[1]&1 != 0, b[1]&2 != 0, string(b[3:3+int(b[2])]), time.Now()
+			p.noRecord = b[1]&4 != 0
 			v.mu.Unlock()
 		}
 	case vkSettings:
@@ -1131,6 +1135,9 @@ func (v *Voice) posLoop(stop chan struct{}) {
 		v.mu.Unlock()
 		if v.Broadcasting() {
 			pres[1] |= 2
+		}
+		if v.NoRecord.Load() {
+			pres[1] |= 4 // please don't save my voice in your replays
 		}
 		pres = append(pres, v.Sub()...)
 		if send := v.sender(); send != nil && (tick%10 == 0 || string(pres) != string(lastPres)) {

@@ -136,6 +136,7 @@ type ui struct {
 	drops                      map[string]*dropState
 	dropBlocks                 map[string]int // how many blocks each dropdown has (for its timing)
 	pitBtn, addSub, stopIso    widget.Clickable
+	noRecBox                   widget.Bool
 	subEd                      widget.Editor
 	subPick, subDel            map[string]*widget.Clickable
 	micLevelKey                byte // animation key for the mic level bar (must not share the sensitivity slider's)
@@ -1804,6 +1805,21 @@ func (u *ui) voiceCard(gtx layout.Context) layout.Dimensions {
 			},
 			vgap(10),
 			u.caption("Uses your default mic and speakers. Use headphones so nobody hears themselves echo."),
+			vgap(8),
+			func(gtx layout.Context) layout.Dimensions {
+				a := u.app
+				u.noRecBox.Value = a.S.NoRecord
+				if u.noRecBox.Update(gtx) {
+					a.S.NoRecord = u.noRecBox.Value
+					a.Voice.NoRecord.Store(a.S.NoRecord)
+					a.Voice.KickPos() // tell the room straight away
+					a.Save()
+				}
+				cb := material.CheckBox(u.th, &u.noRecBox, "Keep my voice out of replays")
+				cb.Color, cb.IconColor, cb.TextSize = colText, colAccent, 13.5
+				return cb.Layout(gtx)
+			},
+			u.caption("Others' RingLink won't save your voice for their replays, and yours won't either. Live voice works as normal."),
 		)
 		return col(gtx, ws...)
 	})
