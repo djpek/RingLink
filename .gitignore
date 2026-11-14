@@ -1,4 +1,2 @@
-/dist/
-/ringlink
-*.exe
-ringlink-linux
+/target
+*.rlv3

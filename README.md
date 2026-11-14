@@ -1,84 +1,52 @@
-# RingLink
+# RingLink 5 (Rust)
 
-Proximity voice chat for **Le Mans Ultimate** and **BeamNG.drive**: the closer someone's car is to yours, the louder they are. Further away they fade out and can be muffled, like you're actually hearing them on track.
+Proximity voice chat for **Le Mans Ultimate** and **BeamNG.drive**: the closer someone's car is to yours, the louder they are.
 
-<p align="center">
-  <img src="docs/room.png" width="380" alt="RingLink in a room with two other people">
-  &nbsp;
-  <img src="docs/lobby.png" width="380" alt="Creating or joining a room">
-</p>
+This is a rewrite of RingLink 4 (Go) in Rust. It keeps every feature of 4.2 and is **not compatible with it**: everyone in a room needs version 5. RingLink 4 is still on the [`v4-go`](../../tree/v4-go) branch.
 
-## How to use
+![RingLink 5](docs/ringlink5.png)
 
-1. Open RingLink (`RingLink.exe` on Windows, `ringlink-linux` on Linux).
-2. One person sets **Max people** (2-40) and clicks **Create room**.
-3. Send the room code (like `K7QM-29XD`) to your friends.
-4. Everyone else pastes the code and clicks **Join room**.
+## What's new in 5
 
-Voice starts automatically once you're in a room. When you're on the same LMU server or BeamMP map, each person's volume follows the distance between your cars. Anywhere else (menus, garage, different servers) it's normal voice chat.
+- **Opus voice** at 48 kHz instead of G.711: clearer, about a sixth of the upload, and lost packets are rebuilt or smoothed over instead of clicking.
+- **Noise suppression** (RNNoise) takes wheel-motor whine, fans and keyboard clatter out of your mic.
+- **Radar**: a small map of who's around your car.
+- **Replay voice fix**: recordings are matched to a replay by track, time *and who was in the session*, so a different session at the same track is never played. If it ever is, **Wrong session** stops it for good.
+- **Deafen**, **mic test** (hear yourself), a **mute on/off** binding, **join / leave / radio sounds**, **Rejoin** for the last room, **always on top**.
+- Signed host / mod changes with a far-future timestamp are refused (they could block later changes).
 
-Under **Appearance** you can make RingLink see-through. On Linux (X11, e.g. Linux Mint) only the background goes see-through, with separate sliders for the background and for panels & buttons; desktops that support it (KDE Plasma) also blur what's behind. On Windows the whole window fades.
+Settings are read from the same file as RingLink 4, so your name, devices, per-person volumes and wheel-button bindings carry over. On Windows, wheel-button bindings need setting once more (they're read a different way now).
 
-Pick your **microphone** and **output** in the Voice panel (or leave them on System default).
+## Use
 
-You can set how loud everyone is, how far voices carry, how muffled they get with distance, and your mic sensitivity.
+1. Open RingLink (`RingLink5.exe` on Windows, `ringlink5-linux` on Linux; run `chmod +x ringlink5-linux` once).
+2. One person sets **Max people** and clicks **Create room**, then sends the code to everyone.
+3. Everyone else pastes the code and clicks **Join room**.
 
-### Voice features
+- **Le Mans Ultimate:** nothing to set up (reads `127.0.0.1:6397`).
+- **BeamNG.drive / BeamMP:** *Options > Other*, turn on **MotionSim** with IP `127.0.0.1`, port `4444`.
 
-<p align="center"><img src="docs/voice.png" width="380" alt="RingLink voice settings: broadcast, push-to-broadcast, volume, range, muffle, directional sound, Doppler and voice in replays"></p>
-
-- **Directional sound:** voices come from where their car is, left, right or behind you (stereo, follows your car's direction; head turning in VR isn't tracked).
-- **Always muffled:** muffles everyone all the time, like talking through helmets or a team radio.
-- **Doppler effect:** a car closing on you sounds slightly higher, one pulling away slightly lower.
-- **Garage = radio:** while you're in the garage, you hear everyone and everyone hears you at full volume, wherever they are.
-- **Push to talk / push to mute:** choose **Voice activated** or **Push to talk** under *How your mic sends*, and bind push-to-talk and push-to-mute to a key or a wheel / button-box button.
-- **Per-person volume and copying settings:** the ⋮ next to someone in the room opens their own volume slider (remembered by name) and **Copy their voice settings**, which copies their "other people's voices" settings to yours.
-- **Host and mods:** whoever makes the room is the host (shown next to their name). In someone's ⋮ menu the host can **Make mod**, and the host and mods can **Mute for everyone** (their RingLink stops sending, and everyone else's drops their voice too). Nobody can mute the host. Changes are signed with the host's or mod's own key, so knowing the room code isn't enough to fake them.
-<p align="center"><img src="docs/pits.png" width="300" alt="The Pits section: pit radio switch, picking a sub-room, adding and removing sub-rooms"></p>
-
-- **Pits: pit radio, sub-rooms, isolate:** the host and mods can turn **Pit radio** on or off for the room (on: in the garage everyone hears each other at full volume; off: the garage works by distance like everywhere else), add permanent **sub-rooms**, and **Isolate for everyone** from someone's ⋮ menu (everyone hears only that person, the rest faded). Anyone can make a sub-room (e.g. a team) by typing a name, and everyone can pick it while someone's in it. In the garage with pit radio on you only hear and talk to your sub-room; on track you hear everyone as usual.
-- **Broadcast to everyone:** click **Broadcast**, or bind **Push-to-broadcast** to a keyboard key or a wheel / button-box button and hold it. Everyone (or just your sub-room, if you picked one, like team radio) hears you at full volume, centred, until you let go. Works while the game is focused (Windows; Linux on X11, e.g. Linux Mint. On Wayland only wheel buttons work).
-- **Voice in replays (LMU):** while you drive, RingLink saves the talking (yours and what you receive, even people too far away to hear, and even with voice chat off). When you watch that session's replay later, even after restarting the game, the voices play again at the right moments and come from the cars. Slow motion and fast forward (0.2x to 4x) play the voice in step; pausing, rewinding and fast skipping stay quiet. Live voice is heard normally (full volume) while you watch. The last 30 sessions are kept in RingLink's settings folder under `voice-replays`. Tick **Keep my voice out of replays** at the bottom of the Voice panel to opt out: other people's RingLink (on this version or newer) won't save your voice, and yours won't either.
-
-### Game setup
-
-Pick your game at the top of the window: **Auto** (whichever game you're driving in), **Le Mans Ultimate** or **BeamNG**.
-
-
-- **Le Mans Ultimate:** nothing to set up. RingLink reads your car position from LMU's local REST API (`127.0.0.1:6397`).
-- **BeamNG.drive / BeamMP:** in *Options > Other*, turn on **MotionSim** with IP `127.0.0.1` and port `4444`.
-
-Use headphones so nobody hears themselves echo.
+`ringlink5-linux --demo` opens a room with pretend drivers so you can look around without a game or friends.
 
 ## How it works
 
-- **Rooms:** the room code is the only thing you share. Each member posts a small announcement (name and network address) to a topic on [ntfy.sh](https://ntfy.sh), a free public message relay. The topic name and the encryption key both come from the room code (Argon2id + XChaCha20-Poly1305), so the relay only ever sees ciphertext.
-- **Voice:** everyone connects directly to everyone else with UDP hole punching (STUN to find public addresses). Audio is 24 kHz mono G.711 mu-law in 20 ms frames (older 16 kHz versions are still understood), encrypted with the room key, and mixed to stereo on playback. Nothing goes through a server.
-- **Big rooms:** up to 40 people. Everyone tells the room who they reach directly; when two people can't connect directly (or it's much slower), their voice goes through whoever has the quickest path to both, passed on still encrypted. In rooms over 8, cars more than 600 m away (further than anyone's range setting) get your voice in low quality instead (8 kHz ADPCM in 60 ms packets, about a fifth of the upload), so it's still in their replays but upload stays low.
-- **Proximity:** each app reads its own car position (LMU REST API or BeamNG MotionSim UDP) and shares it with the room. Distances are only compared between people in the same game. Positions are moved forward along each car's velocity between updates (LMU only updates them 5 times a second), and your direction comes from how your car moves.
-- **Replays:** LMU's session clock (`/rest/watch/sessionInfo`) timestamps the recorded voice; the replay position comes from LMU's `ws://127.0.0.1:6398/websocket/replaymetrics` stream. Recordings are matched to a replay by track and time span.
-- **Audio I/O:** Windows uses winmm (no extra installs). Linux uses `parec`/`pacat`, `pw-record`/`pw-play` or `arecord`/`aplay`, whichever is installed; device lists come from `pactl`.
+- **Rooms:** the room code is the only thing you share. Members post a small encrypted announcement (name, network address) to a topic on [ntfy.sh](https://ntfy.sh); topic and key both come from the code (Argon2id + XChaCha20-Poly1305), so the relay only sees ciphertext.
+- **Voice:** everyone connects directly to everyone else over UDP (STUN + hole punching). When two people can't reach each other, whoever has the quickest path to both passes the still-encrypted packets on. In rooms over 8, cars more than 600 m away get a low-bitrate stream (enough for their replays).
+- **Proximity:** each app reads its own car position and shares it; volume, muffling, left/right and Doppler follow from that.
+- **Audio I/O:** Linux uses `parec`/`pacat`, `pw-record`/`pw-play` or `arecord`/`aplay`; Windows uses WASAPI.
 
-Anyone with a room's code can join it, so only share codes with people you want in.
-
-## Building
-
-Requires Go 1.26+.
+## Build
 
 ```sh
-go test ./...
-go build -o ringlink-linux .                                                  # Linux (needs cgo for the Gio UI)
-GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui" -o RingLink.exe .  # Windows
+cargo test
+cargo build --release                                   # Linux
+cargo build --release --target x86_64-pc-windows-gnu    # Windows (needs mingw-w64 and cmake)
 ```
 
-For screenshots or testing without a microphone, build with `-tags fakeaudio`: the mic "talks" every few seconds and sound output is discarded.
-
-UI built with [Gio](https://gioui.org) (a lightly patched copy is in `third_party/gioui` to support see-through backgrounds on X11; Gio is dual Unlicense/MIT licensed), using the [SN Pro](https://github.com/supernotes/sn-pro) font (SIL Open Font License 1.1, see `fonts/OFL.txt`).
-
-<p align="center"><img src="docs/three-people.png" alt="Three people in one room"></p>
+Linux build needs `cmake` (for Opus). No audio or GUI development packages are required.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE): free to use, change and share for any **noncommercial** purpose. You may not sell RingLink or use it commercially. Anyone who shares it or a changed version must include the license and this notice:
+[PolyForm Noncommercial 1.0.0](LICENSE). Required Notice: Copyright (c) 2026 djpek (https://github.com/djpek/RingLink)
 
-> Required Notice: Copyright (c) 2026 djpek (https://github.com/djpek/RingLink)
+Font: [SN Pro](https://github.com/supernotes/sn-pro) (SIL Open Font License 1.1, `assets/OFL.txt`).
